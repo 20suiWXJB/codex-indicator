@@ -4,6 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 use tauri::{
     menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
@@ -15,6 +16,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 const PROJECT_ROOT: &str = r"D:\Code\Tauri\indicator";
 const CODEX_SESSIONS_ROOT: &str = r"C:\Users\1\.codex\sessions";
 const DONE_SETTLE_MS: i128 = 3500;
+const SESSION_RUNNING_TTL: Duration = Duration::from_secs(2 * 60);
 const MAIN_WINDOW: &str = "main";
 const OPEN_EVENTS: &str = "indicator-open-events";
 
@@ -127,6 +129,30 @@ fn running_from_codex_session() -> StatusPayload {
     }
 }
 
+fn waiting_from_codex_session() -> StatusPayload {
+    StatusPayload {
+        status: "waiting".to_string(),
+        source: "codex".to_string(),
+        event: "PermissionRequest".to_string(),
+        summary: "Codex 正在等待批准".to_string(),
+        detail: String::new(),
+        updated_at: now_timestamp(),
+        ttl_ms: 0,
+    }
+}
+
+fn interrupted_from_codex_session() -> StatusPayload {
+    StatusPayload {
+        status: "interrupted".to_string(),
+        source: "codex".to_string(),
+        event: "turn_aborted".to_string(),
+        summary: "Codex 已中断".to_string(),
+        detail: String::new(),
+        updated_at: now_timestamp(),
+        ttl_ms: 0,
+    }
+}
+
 fn append_log(root: &Path, message: &str) {
     let _ = fs::create_dir_all(root.join("logs"));
     if let Ok(mut file) = OpenOptions::new()
@@ -179,11 +205,12 @@ pub fn read_effective_status_from_dirs(root: &Path, sessions_root: &Path) -> Sta
         return payload;
     }
 
-    if latest_codex_session_is_running(sessions_root) {
-        return running_from_codex_session();
+    match latest_codex_session_status(sessions_root) {
+        CodexSessionStatus::Waiting => waiting_from_codex_session(),
+        CodexSessionStatus::Interrupted => interrupted_from_codex_session(),
+        CodexSessionStatus::Running => running_from_codex_session(),
+        CodexSessionStatus::Idle => payload,
     }
-
-    payload
 }
 
 fn is_fresh_done(payload: &StatusPayload) -> bool {
@@ -199,18 +226,38 @@ fn is_fresh_done(payload: &StatusPayload) -> bool {
     (0..DONE_SETTLE_MS).contains(&age_ms)
 }
 
-fn latest_codex_session_is_running(sessions_root: &Path) -> bool {
-    let Some(path) = latest_codex_session_file(sessions_root) else {
-        return false;
-    };
-    let Ok(content) = fs::read_to_string(path) else {
-        return false;
-    };
-
-    session_content_has_unfinished_turn(&content)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSessionStatus {
+    Idle,
+    Running,
+    Waiting,
+    Interrupted,
 }
 
-fn latest_codex_session_file(sessions_root: &Path) -> Option<PathBuf> {
+fn latest_codex_session_status(sessions_root: &Path) -> CodexSessionStatus {
+    let Some((path, modified)) = latest_codex_session_file(sessions_root) else {
+        return CodexSessionStatus::Idle;
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return CodexSessionStatus::Idle;
+    };
+
+    match session_content_status(&content) {
+        CodexSessionStatus::Running if !session_file_is_recent(modified) => {
+            CodexSessionStatus::Idle
+        }
+        status => status,
+    }
+}
+
+fn session_file_is_recent(modified: SystemTime) -> bool {
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= SESSION_RUNNING_TTL,
+        Err(_) => true,
+    }
+}
+
+fn latest_codex_session_file(sessions_root: &Path) -> Option<(PathBuf, SystemTime)> {
     let mut day_dirs = Vec::new();
     for year in read_numeric_dirs(sessions_root) {
         for month in read_numeric_dirs(&year) {
@@ -228,7 +275,6 @@ fn latest_codex_session_file(sessions_root: &Path) -> Option<PathBuf> {
         .take(3)
         .filter_map(latest_jsonl_in_dir)
         .max_by_key(|(_, modified)| *modified)
-        .map(|(path, _)| path)
 }
 
 fn read_numeric_dirs(path: &Path) -> Vec<PathBuf> {
@@ -270,9 +316,12 @@ struct CodexTurnState {
     activity: bool,
     final_message: bool,
     completed: bool,
+    waiting: bool,
+    waiting_call_id: Option<String>,
+    interrupted: bool,
 }
 
-fn session_content_has_unfinished_turn(content: &str) -> bool {
+fn session_content_status(content: &str) -> CodexSessionStatus {
     let mut turn = CodexTurnState::default();
 
     for line in content.lines() {
@@ -293,10 +342,17 @@ fn session_content_has_unfinished_turn(content: &str) -> bool {
         apply_session_event(&value, &mut turn);
     }
 
-    turn.turn_id.is_some()
-        && (turn.started || turn.activity)
-        && !turn.final_message
-        && !turn.completed
+    if turn.turn_id.is_none() || turn.final_message || turn.completed {
+        CodexSessionStatus::Idle
+    } else if turn.interrupted {
+        CodexSessionStatus::Interrupted
+    } else if turn.waiting {
+        CodexSessionStatus::Waiting
+    } else if turn.started || turn.activity {
+        CodexSessionStatus::Running
+    } else {
+        CodexSessionStatus::Idle
+    }
 }
 
 fn extract_turn_id(value: &Value) -> Option<String> {
@@ -319,6 +375,15 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
     let payload_type = string_at(value, &["payload", "type"]).unwrap_or_default();
 
     if outer_type == "event_msg" {
+        if is_interrupted_event(payload_type) {
+            turn.interrupted = true;
+            return;
+        }
+        if is_permission_request_event(value, payload_type) {
+            turn.waiting = true;
+            return;
+        }
+
         match payload_type {
             "task_started" => {
                 turn.started = true;
@@ -338,11 +403,18 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
     }
 
     match payload_type {
-        "reasoning"
-        | "function_call"
-        | "function_call_output"
-        | "custom_tool_call"
-        | "custom_tool_call_output" => turn.activity = true,
+        "reasoning" => turn.activity = true,
+        "function_call" | "custom_tool_call" => {
+            turn.activity = true;
+            if contains_required_escalation(value) {
+                turn.waiting = true;
+                turn.waiting_call_id = extract_call_id(value).map(str::to_string);
+            }
+        }
+        "function_call_output" | "custom_tool_call_output" => {
+            turn.activity = true;
+            clear_waiting_call_if_resolved(value, turn);
+        }
         "message"
             if string_at(value, &["payload", "role"]) == Some("assistant")
                 && string_at(value, &["payload", "phase"]) == Some("final_answer") =>
@@ -350,6 +422,70 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
             turn.final_message = true;
         }
         _ => {}
+    }
+}
+
+fn is_interrupted_event(payload_type: &str) -> bool {
+    matches!(
+        payload_type,
+        "turn_aborted"
+            | "turn_interrupted"
+            | "interrupted"
+            | "user_interrupted"
+            | "user-interrupted"
+    )
+}
+
+fn is_permission_request_event(value: &Value, payload_type: &str) -> bool {
+    matches!(
+        payload_type,
+        "PermissionRequest" | "permission_request" | "permission-request" | "approval_request"
+    ) || string_at(value, &["payload", "hook_event_name"]) == Some("PermissionRequest")
+        || string_at(value, &["payload", "hook-event-name"]) == Some("PermissionRequest")
+}
+
+fn extract_call_id(value: &Value) -> Option<&str> {
+    string_at(value, &["payload", "call_id"])
+        .or_else(|| string_at(value, &["payload", "id"]))
+        .or_else(|| string_at(value, &["payload", "tool_call_id"]))
+}
+
+fn clear_waiting_call_if_resolved(value: &Value, turn: &mut CodexTurnState) {
+    if !turn.waiting {
+        return;
+    }
+
+    match (turn.waiting_call_id.as_deref(), extract_call_id(value)) {
+        (None, _) => turn.waiting = false,
+        (Some(waiting_id), Some(output_id)) if waiting_id == output_id => {
+            turn.waiting = false;
+            turn.waiting_call_id = None;
+        }
+        _ => {}
+    }
+}
+
+fn contains_required_escalation(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            if key == "sandbox_permissions" && child.as_str() == Some("require_escalated") {
+                return true;
+            }
+
+            if key == "arguments" {
+                if let Some(text) = child.as_str() {
+                    if text.contains("sandbox_permissions") && text.contains("require_escalated") {
+                        return serde_json::from_str::<Value>(text)
+                            .map(|parsed| contains_required_escalation(&parsed))
+                            .unwrap_or(true);
+                    }
+                }
+            }
+
+            contains_required_escalation(child)
+        }),
+        Value::Array(items) => items.iter().any(contains_required_escalation),
+        _ => false,
     }
 }
 

@@ -3,7 +3,7 @@ use indicator_lib::{
 };
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 fn temp_state_dir(name: &str) -> PathBuf {
@@ -26,8 +26,19 @@ fn temp_sessions_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn write_session(root: &PathBuf, name: &str, content: &str) {
-    fs::write(root.join("2026").join("07").join("02").join(name), content).expect("write session");
+fn write_session(root: &PathBuf, name: &str, content: &str) -> PathBuf {
+    let path = root.join("2026").join("07").join("02").join(name);
+    fs::write(&path, content).expect("write session");
+    path
+}
+
+fn set_session_modified(path: &PathBuf, modified: SystemTime) {
+    let file = fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open session for mtime");
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .expect("set session mtime");
 }
 
 fn current_rfc3339() -> String {
@@ -157,6 +168,103 @@ fn expired_done_status_uses_latest_unfinished_codex_turn() {
     assert_eq!(payload.status, "running");
     assert_eq!(payload.source, "codex");
     assert_eq!(payload.summary, "Codex 运行中");
+}
+
+#[test]
+fn fresh_unfinished_codex_session_reports_running() {
+    let root = temp_state_dir("fresh-running");
+    let sessions = temp_sessions_dir("fresh-running");
+    write_session(
+        &sessions,
+        "rollout-active.jsonl",
+        [
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-active"}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"turn-active"}}}"#,
+        ]
+        .join("\n")
+        .as_str(),
+    );
+
+    let payload = read_effective_status_from_dirs(&root, &sessions);
+
+    assert_eq!(payload.status, "running");
+}
+
+#[test]
+fn stale_unfinished_codex_session_falls_back_to_idle() {
+    let root = temp_state_dir("stale-running");
+    let sessions = temp_sessions_dir("stale-running");
+    let session_path = write_session(
+        &sessions,
+        "rollout-stale.jsonl",
+        [
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-stale"}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"turn-stale"}}}"#,
+        ]
+        .join("\n")
+        .as_str(),
+    );
+    set_session_modified(
+        &session_path,
+        SystemTime::now() - Duration::from_secs(2 * 60 + 1),
+    );
+
+    let payload = read_effective_status_from_dirs(&root, &sessions);
+
+    assert_eq!(payload.status, "idle");
+}
+
+#[test]
+fn approval_request_in_codex_session_reports_waiting() {
+    let root = temp_state_dir("approval-waiting");
+    let sessions = temp_sessions_dir("approval-waiting");
+    let approval_call = serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "call_id": "call-approval",
+            "name": "functions.shell_command",
+            "arguments": "{\"command\":\"cargo test\",\"sandbox_permissions\":\"require_escalated\"}",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-waiting"
+            }
+        }
+    })
+    .to_string();
+    write_session(
+        &sessions,
+        "rollout-waiting.jsonl",
+        [
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-waiting"}}"#,
+            approval_call.as_str(),
+        ]
+        .join("\n")
+        .as_str(),
+    );
+
+    let payload = read_effective_status_from_dirs(&root, &sessions);
+
+    assert_eq!(payload.status, "waiting");
+}
+
+#[test]
+fn aborted_codex_turn_reports_interrupted() {
+    let root = temp_state_dir("aborted");
+    let sessions = temp_sessions_dir("aborted");
+    write_session(
+        &sessions,
+        "rollout-aborted.jsonl",
+        [
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-aborted"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-aborted"}}"#,
+        ]
+        .join("\n")
+        .as_str(),
+    );
+
+    let payload = read_effective_status_from_dirs(&root, &sessions);
+
+    assert_eq!(payload.status, "interrupted");
 }
 
 #[test]
