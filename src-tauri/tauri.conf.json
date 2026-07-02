@@ -12,9 +12,22 @@
   "app": {
     "windows": [
       {
-        "title": "indicator",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "AI 状态指示器",
+        "width": 220,
+        "height": 72,
+        "minWidth": 220,
+        "minHeight": 72,
+        "maxWidth": 220,
+        "maxHeight": 300,
+        "x": 1640,
+        "y": 24,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false
       }
     ],
     "security": {
