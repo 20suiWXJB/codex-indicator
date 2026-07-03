@@ -105,7 +105,7 @@ button {
 
 .actions {
   display: grid;
-  grid-template-columns: 22px 22px;
+  grid-template-columns: repeat(3, 22px);
   gap: 4px;
 }
 
@@ -218,6 +218,10 @@ button {
   color: #ff8a62;
 }
 
+.event-connecting .event-body {
+  color: #a0a0a0;
+}
+
 .lamp[data-status="waiting"] {
   background: #f4c95d;
   box-shadow: 0 0 0 5px rgba(244, 201, 93, 0.16), 0 0 18px rgba(244, 201, 93, 0.48);
@@ -244,6 +248,25 @@ button {
   box-shadow: 0 0 0 5px rgba(255, 138, 98, 0.16), 0 0 18px rgba(255, 138, 98, 0.44);
 }
 
+/* 新增：连接中状态样式 - 灰色脉冲动画 */
+.lamp[data-status="connecting"] {
+  background: #a0a0a0;
+  box-shadow: 0 0 0 5px rgba(160, 160, 160, 0.16), 0 0 18px rgba(160, 160, 160, 0.36);
+  animation: connecting-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes connecting-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+}
+
 @keyframes error-pulse {
   0%,
   100% {
@@ -251,5 +274,372 @@ button {
   }
   50% {
     opacity: 0.38;
+  }
+}
+
+/* 设置窗口是带边框的普通窗口：恢复文档默认滚动（全局 overflow:hidden 只为主窗口胶囊服务） */
+html[data-view="settings"],
+html[data-view="settings"] body,
+html[data-view="settings"] #app {
+  overflow: visible;
+}
+
+body[data-view="settings"],
+body[data-view="settings"] #app {
+  min-height: 100vh;
+  color: #18201d;
+  background: #ffffff;
+}
+
+body[data-view="settings"][data-theme="dark"],
+body[data-view="settings"][data-theme="dark"] #app {
+  color: #ffffff;
+  background: #0d0d0d;
+}
+
+@media (prefers-color-scheme: dark) {
+  body[data-view="settings"][data-theme="system"],
+  body[data-view="settings"][data-theme="system"] #app {
+    color: #ffffff;
+    background: #0d0d0d;
+  }
+}
+
+.settings-shell {
+  width: min(100%, 980px);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.settings-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 20px;
+  align-items: start;
+  padding: 8px 0 18px;
+  border-bottom: 2px solid currentColor;
+}
+
+.settings-kicker,
+.settings-lede {
+  margin: 0;
+  color: color-mix(in srgb, currentColor 68%, transparent);
+}
+
+.settings-kicker {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.settings-header h1 {
+  margin: 4px 0 6px;
+  font-size: 34px;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.settings-lede {
+  max-width: 620px;
+  font-size: 13px;
+}
+
+.settings-close,
+.settings-save,
+.setting-action {
+  min-height: 32px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.settings-close,
+.settings-save {
+  padding: 0 14px;
+  font-weight: 700;
+}
+
+.settings-close:hover,
+.settings-save:hover,
+.setting-action:hover {
+  color: #ffffff;
+  background: #1f4f46;
+}
+
+.settings-alert {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-left: 4px solid #b54332;
+  background: rgba(181, 67, 50, 0.12);
+  color: #7d2c22;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+  padding: 20px 0 72px;
+}
+
+.settings-nav {
+  position: sticky;
+  top: 16px;
+  display: grid;
+  gap: 4px;
+}
+
+.settings-nav-link {
+  padding: 8px 10px;
+  border-left: 3px solid transparent;
+  color: inherit;
+  text-decoration: none;
+}
+
+.settings-nav-link:hover {
+  border-left-color: #1f4f46;
+  background: rgba(31, 79, 70, 0.1);
+}
+
+.settings-form {
+  display: grid;
+  gap: 28px;
+}
+
+.settings-section {
+  scroll-margin-top: 16px;
+}
+
+.settings-section h2 {
+  margin: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+  font-size: 16px;
+  letter-spacing: 0;
+}
+
+.setting-list {
+  display: grid;
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 240px);
+  gap: 24px;
+  align-items: center;
+  padding: 16px 0;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+}
+
+.setting-title {
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.setting-description,
+.setting-compat,
+.setting-current {
+  margin: 6px 0 0;
+  color: color-mix(in srgb, currentColor 66%, transparent);
+}
+
+.setting-compat {
+  color: color-mix(in srgb, #1f4f46 72%, currentColor);
+}
+
+.setting-current {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.setting-control {
+  display: grid;
+  justify-items: end;
+}
+
+.setting-control select,
+.setting-control input[type="text"],
+.setting-control input[type="number"] {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid color-mix(in srgb, currentColor 32%, transparent);
+  border-radius: 6px;
+  padding: 0 10px;
+  color: inherit;
+  background: color-mix(in srgb, #ffffff 72%, transparent);
+}
+
+body[data-theme="dark"] .setting-control select,
+body[data-theme="dark"] .setting-control input[type="text"],
+body[data-theme="dark"] .setting-control input[type="number"] {
+  background: color-mix(in srgb, #202625 88%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  body[data-view="settings"][data-theme="system"] .setting-control select,
+  body[data-view="settings"][data-theme="system"] .setting-control input[type="text"],
+  body[data-view="settings"][data-theme="system"] .setting-control input[type="number"] {
+    background: color-mix(in srgb, #202625 88%, transparent);
+  }
+}
+
+/* 深色模式下提升次要文字对比度 */
+body[data-theme="dark"] .settings-kicker,
+body[data-theme="dark"] .settings-lede,
+body[data-theme="dark"] .setting-description,
+body[data-theme="dark"] .setting-compat,
+body[data-theme="dark"] .setting-current,
+body[data-theme="dark"] .number-field span,
+body[data-theme="dark"] .settings-status {
+  color: color-mix(in srgb, currentColor 87%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  body[data-view="settings"][data-theme="system"] .settings-kicker,
+  body[data-view="settings"][data-theme="system"] .settings-lede,
+  body[data-view="settings"][data-theme="system"] .setting-description,
+  body[data-view="settings"][data-theme="system"] .setting-compat,
+  body[data-view="settings"][data-theme="system"] .setting-current,
+  body[data-view="settings"][data-theme="system"] .number-field span,
+  body[data-view="settings"][data-theme="system"] .settings-status {
+    color: color-mix(in srgb, currentColor 87%, transparent);
+  }
+}
+
+.path-field:disabled {
+  opacity: 0.58;
+}
+
+.number-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+
+.number-field span {
+  color: color-mix(in srgb, currentColor 64%, transparent);
+  font-weight: 700;
+}
+
+.switch {
+  position: relative;
+  display: inline-grid;
+  width: 48px;
+  height: 26px;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+}
+
+.switch span {
+  border: 1px solid color-mix(in srgb, currentColor 38%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.switch span::after {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+  transition: transform 0.16s ease;
+}
+
+.switch input:checked + span {
+  color: #ffffff;
+  background: #1f4f46;
+}
+
+.switch input:checked + span::after {
+  transform: translateX(22px);
+}
+
+.setting-action {
+  width: 100%;
+  padding: 0 12px;
+  font-weight: 700;
+}
+
+.settings-diagnostics {
+  margin: -52px 0 76px 192px;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 6px;
+  color: inherit;
+  background: color-mix(in srgb, currentColor 7%, transparent);
+  font-size: 12px;
+}
+
+.settings-footer {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 12px max(24px, calc((100vw - 980px) / 2 + 24px));
+  border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  background: color-mix(in srgb, #ffffff 92%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+body[data-theme="dark"] .settings-footer {
+  background: color-mix(in srgb, #0d0d0d 92%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  body[data-view="settings"][data-theme="system"] .settings-footer {
+    background: color-mix(in srgb, #0d0d0d 92%, transparent);
+  }
+}
+
+.settings-status {
+  overflow: hidden;
+  color: color-mix(in srgb, currentColor 70%, transparent);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .settings-shell {
+    padding: 16px;
+  }
+
+  .settings-layout {
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
+
+  .settings-nav {
+    position: static;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .setting-row {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .setting-control {
+    justify-items: stretch;
+  }
+
+  .settings-diagnostics {
+    margin: -52px 0 76px;
   }
 }

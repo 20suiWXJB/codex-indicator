@@ -3,7 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 
 test("main floating pill starts native dragging from non-button left pointer presses", () => {
-  const source = fs.readFileSync("src/main.ts", "utf8");
+  const source = fs.readFileSync("src/mainPanel.ts", "utf8");
 
   assert.match(source, /import\s+\{\s*getCurrentWindow\s*\}\s+from\s+"@tauri-apps\/api\/window"/);
   assert.match(source, /\.pill"\)!\s*;/);

@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "test:bridge": "node tests/agentStatusBridge.test.mjs",
+    "test:settings": "node tests/settingsModel.test.mjs",
     "test:ui": "node tests/statusPresenter.test.mjs",
+    "test:settings-page": "node tests/settingsPage.test.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

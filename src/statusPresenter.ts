@@ -4,7 +4,8 @@ export type IndicatorStatus =
   | "done"
   | "error"
   | "interrupted"
-  | "idle";
+  | "idle"
+  | "connecting";  // 新增：连接中状态
 
 export interface StatusPayload {
   status: IndicatorStatus;
@@ -39,11 +40,13 @@ const FALLBACK_LABELS: Record<IndicatorStatus, string> = {
   error: "异常",
   interrupted: "已中断",
   idle: "空闲",
+  connecting: "连接中",  // 新增：连接中状态标签
 };
 
 export function resolveDisplayStatus(
   payload: StatusPayload,
   nowMs = Date.now(),
+  doneSettleMs = DONE_SETTLE_MS,
 ): IndicatorStatus {
   if (payload.status !== "done") {
     return payload.status;
@@ -54,7 +57,7 @@ export function resolveDisplayStatus(
     return "done";
   }
 
-  return nowMs - updatedMs >= DONE_SETTLE_MS ? "idle" : "done";
+  return nowMs - updatedMs >= doneSettleMs ? "idle" : "done";
 }
 
 export function describeStatus(payload: StatusPayload): StatusCopy {
@@ -94,6 +97,19 @@ export function idleStatus(summary = "无活动"): StatusPayload {
     event: "",
     summary,
     detail: "",
+    updatedAt: new Date().toISOString(),
+    ttlMs: 0,
+  };
+}
+
+// 新增：初始连接中状态
+export function connectingStatus(): StatusPayload {
+  return {
+    status: "connecting",
+    source: "indicator",
+    event: "initializing",
+    summary: "正在连接...",
+    detail: "正在读取 Codex 状态",
     updatedAt: new Date().toISOString(),
     ttlMs: 0,
   };

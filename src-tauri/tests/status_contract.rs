@@ -2,6 +2,7 @@ use indicator_lib::{
     read_effective_status_from_dirs, read_recent_events_from_dir, read_status_from_dir,
 };
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -298,4 +299,62 @@ fn malformed_session_file_falls_back_to_state_file_result() {
     let payload = read_effective_status_from_dirs(&root, &sessions);
 
     assert_eq!(payload.status, "idle");
+}
+
+// 覆盖解析缓存的增量路径：第一次轮询解析后文件被追加，第二次轮询必须反映新增事件
+#[test]
+fn appended_session_events_update_status_between_polls() {
+    let root = temp_state_dir("incremental");
+    let sessions = temp_sessions_dir("incremental");
+    let path = write_session(
+        &sessions,
+        "rollout-incremental.jsonl",
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-inc\"}}\n",
+    );
+
+    let first = read_effective_status_from_dirs(&root, &sessions);
+    assert_eq!(first.status, "running");
+
+    let mut file = fs::File::options()
+        .append(true)
+        .open(&path)
+        .expect("open session for append");
+    writeln!(
+        file,
+        r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"turn-inc"}}}}"#
+    )
+    .expect("append complete event");
+    drop(file);
+
+    let second = read_effective_status_from_dirs(&root, &sessions);
+    assert_eq!(second.status, "idle");
+}
+
+// 覆盖缓存失效路径：文件被截断重写（变小）时必须全量重建，不能沿用旧状态
+#[test]
+fn rewritten_session_file_is_reparsed_from_scratch() {
+    let root = temp_state_dir("rewritten");
+    let sessions = temp_sessions_dir("rewritten");
+    let path = write_session(
+        &sessions,
+        "rollout-rewrite.jsonl",
+        [
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-rw"}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","internal_chat_message_metadata_passthrough":{"turn_id":"turn-rw"}}}"#,
+        ]
+        .join("\n")
+        .as_str(),
+    );
+
+    let first = read_effective_status_from_dirs(&root, &sessions);
+    assert_eq!(first.status, "running");
+
+    fs::write(
+        &path,
+        r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-rw2"}}"#,
+    )
+    .expect("rewrite session");
+
+    let second = read_effective_status_from_dirs(&root, &sessions);
+    assert_eq!(second.status, "interrupted");
 }
