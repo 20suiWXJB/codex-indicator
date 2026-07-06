@@ -12,6 +12,7 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
 $StateDir = Join-Path $ProjectRoot "state"
 $LogsDir = Join-Path $ProjectRoot "logs"
 $StatusPath = Join-Path $StateDir "status.json"
+$StatusDir = Join-Path $StateDir "status"
 $EventsPath = Join-Path $StateDir "events.jsonl"
 $LogPath = Join-Path $LogsDir "indicator.log"
 
@@ -40,6 +41,34 @@ function Get-JsonProperty {
     }
 
     return $null
+}
+
+function Get-StableHash {
+    param([string]$Value)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+        $hash = $sha.ComputeHash($bytes)
+        return -join ($hash[0..7] | ForEach-Object { $_.ToString("x2") })
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function ConvertTo-InstanceKeyPart {
+    param([string]$Value)
+
+    $key = ($Value -replace '[<>:"/\\|?*\x00-\x1F]', "_").Trim()
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        return $null
+    }
+
+    if ($key.Length -gt 80) {
+        return $key.Substring(0, 80)
+    }
+
+    return $key
 }
 
 function ConvertTo-ShortText {
@@ -107,11 +136,15 @@ function ConvertFrom-NotifyText {
     }
 
     if ($detail -match "\bagent-turn-complete\b") {
-        return [pscustomobject]@{
+        $event = [ordered]@{
             type = "agent-turn-complete"
             source = "codex"
             detail = $detail
         }
+        if ($detail -match "\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b") {
+            $event.session_id = $Matches[0]
+        }
+        return [pscustomobject]$event
     }
 
     return [pscustomobject]@{
@@ -150,6 +183,7 @@ function Get-Encoding {
 
 function Ensure-StateDirectories {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $StatusDir | Out-Null
     New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
 }
 
@@ -196,6 +230,50 @@ function Get-EventType {
     param([object]$Event)
 
     return Get-JsonProperty $Event @("type", "hook_event_name", "hook-event-name")
+}
+
+function Get-EventCwd {
+    param([object]$Event)
+
+    return ConvertTo-ShortText (Get-JsonProperty $Event @("cwd", "current_working_directory", "current-working-directory"))
+}
+
+function Get-EventInstanceInfo {
+    param([object]$Event)
+
+    $payload = Get-JsonProperty $Event @("payload")
+    $id = Get-JsonProperty $Event @("session_id", "session-id", "sessionId", "thread_id", "thread-id", "threadId", "conversation_id", "conversation-id", "conversationId")
+    if ([string]::IsNullOrWhiteSpace((ConvertTo-ShortText $id))) {
+        $id = Get-JsonProperty $payload @("session_id", "session-id", "sessionId", "thread_id", "thread-id", "threadId", "conversation_id", "conversation-id", "conversationId")
+    }
+
+    $cwd = Get-EventCwd $Event
+    if ([string]::IsNullOrWhiteSpace($cwd)) {
+        $cwd = ConvertTo-ShortText (Get-JsonProperty $payload @("cwd", "current_working_directory", "current-working-directory"))
+    }
+
+    $idText = ConvertTo-ShortText $id
+    if (-not [string]::IsNullOrWhiteSpace($idText)) {
+        $key = ConvertTo-InstanceKeyPart $idText
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            return [ordered]@{
+                Key = $key
+                Cwd = $cwd
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($cwd)) {
+        return [ordered]@{
+            Key = Get-StableHash $cwd
+            Cwd = $cwd
+        }
+    }
+
+    return [ordered]@{
+        Key = "default"
+        Cwd = ""
+    }
 }
 
 function Get-EventDetail {
@@ -296,11 +374,14 @@ try {
 
     Ensure-StateDirectories
     $record = ConvertTo-StatusRecord $event
+    $instance = Get-EventInstanceInfo $event
     $timestamp = Get-Timestamp
     $eventLine = [ordered]@{
         status = $record.Status
         source = $record.Source
         event = $record.Event
+        instance = $instance.Key
+        cwd = $instance.Cwd
         summary = $record.Summary
         detail = $record.Detail
         createdAt = $timestamp
@@ -313,11 +394,15 @@ try {
             status = $record.Status
             source = $record.Source
             event = $record.Event
+            instance = $instance.Key
+            cwd = $instance.Cwd
             summary = $record.Summary
             detail = $record.Detail
             updatedAt = $timestamp
             ttlMs = 0
         }
+        $instanceStatusPath = Join-Path $StatusDir ("{0}.json" -f $instance.Key)
+        Write-JsonAtomic -Path $instanceStatusPath -Value $status
         Write-JsonAtomic -Path $StatusPath -Value $status
     }
 } catch {

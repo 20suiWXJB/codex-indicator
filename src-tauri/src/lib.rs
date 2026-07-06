@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
 use tauri::{
@@ -16,7 +17,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 // 移除硬编码路径，改为运行时检测
 const DONE_SETTLE_MS: i128 = 3500;
-const SESSION_RUNNING_TTL: Duration = Duration::from_secs(2 * 60);
+const DEFAULT_SESSION_RUNNING_TTL: Duration = Duration::from_secs(2 * 60);
+const DEFAULT_ACTIVE_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAIN_WINDOW: &str = "main";
 const SETTINGS_WINDOW: &str = "settings";
 const OPEN_EVENTS: &str = "indicator-open-events";
@@ -41,6 +43,26 @@ pub struct StatusPayload {
     pub ttl_ms: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceStatus {
+    pub id: String,
+    pub label: String,
+    pub cwd: String,
+    pub status: String,
+    pub summary: String,
+    pub detail: String,
+    pub updated_at: String,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiStatusPayload {
+    pub aggregate: StatusPayload,
+    pub instances: Vec<InstanceStatus>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventPayload {
@@ -56,6 +78,12 @@ pub struct EventPayload {
     pub detail: String,
     #[serde(default = "now_timestamp")]
     pub created_at: String,
+    #[serde(default)]
+    pub instance: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -85,12 +113,28 @@ pub struct AppSettings {
     pub codex_sessions_dir: String,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u32,
+    #[serde(default = "default_instance_active_window_minutes")]
+    pub instance_active_window_minutes: u32,
+    #[serde(default = "default_session_running_ttl_seconds")]
+    pub session_running_ttl_seconds: u32,
+    #[serde(default = "default_true")]
+    pub show_instance_list: bool,
+    #[serde(default = "default_true")]
+    pub event_instance_prefix: bool,
     #[serde(default = "default_true")]
     pub notify_on_waiting: bool,
     #[serde(default = "default_true")]
     pub notify_on_error: bool,
     #[serde(default = "default_show_done_settle_ms")]
     pub show_done_settle_ms: u32,
+    #[serde(default = "default_true")]
+    pub running_breath_enabled: bool,
+    #[serde(default = "default_running_breath_period_ms")]
+    pub running_breath_period_ms: u32,
+    #[serde(default = "default_true")]
+    pub status_blink_enabled: bool,
+    #[serde(default = "default_status_blink_count")]
+    pub status_blink_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -152,8 +196,24 @@ fn default_poll_interval_ms() -> u32 {
     500
 }
 
+fn default_instance_active_window_minutes() -> u32 {
+    10
+}
+
+fn default_session_running_ttl_seconds() -> u32 {
+    120
+}
+
 fn default_show_done_settle_ms() -> u32 {
     3500
+}
+
+fn default_running_breath_period_ms() -> u32 {
+    2400
+}
+
+fn default_status_blink_count() -> u32 {
+    3
 }
 
 pub fn default_settings() -> AppSettings {
@@ -170,9 +230,17 @@ pub fn default_settings() -> AppSettings {
         codex_sessions_dir_mode: default_path_mode(),
         codex_sessions_dir: String::new(),
         poll_interval_ms: default_poll_interval_ms(),
+        instance_active_window_minutes: default_instance_active_window_minutes(),
+        session_running_ttl_seconds: default_session_running_ttl_seconds(),
+        show_instance_list: true,
+        event_instance_prefix: true,
         notify_on_waiting: true,
         notify_on_error: true,
         show_done_settle_ms: default_show_done_settle_ms(),
+        running_breath_enabled: true,
+        running_breath_period_ms: default_running_breath_period_ms(),
+        status_blink_enabled: true,
+        status_blink_count: default_status_blink_count(),
     }
 }
 
@@ -256,7 +324,11 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.codex_sessions_dir = settings.codex_sessions_dir.trim().to_string();
     settings.panel_expanded_height = settings.panel_expanded_height.clamp(220, 620);
     settings.poll_interval_ms = settings.poll_interval_ms.clamp(250, 10_000);
+    settings.instance_active_window_minutes = settings.instance_active_window_minutes.clamp(1, 60);
+    settings.session_running_ttl_seconds = settings.session_running_ttl_seconds.clamp(30, 1_800);
     settings.show_done_settle_ms = settings.show_done_settle_ms.clamp(500, 30_000);
+    settings.running_breath_period_ms = settings.running_breath_period_ms.clamp(800, 6_000);
+    settings.status_blink_count = settings.status_blink_count.clamp(1, 10);
     settings
 }
 
@@ -363,12 +435,16 @@ fn running_from_codex_session() -> StatusPayload {
     }
 }
 
-fn waiting_from_codex_session() -> StatusPayload {
+fn waiting_from_codex_session(kind: WaitKind) -> StatusPayload {
+    let (event, summary) = match kind {
+        WaitKind::Approval => ("PermissionRequest", "Codex 正在等待批准"),
+        WaitKind::Question => ("Question", "Codex 正在等你选择选项"),
+    };
     StatusPayload {
         status: "waiting".to_string(),
         source: "codex".to_string(),
-        event: "PermissionRequest".to_string(),
-        summary: "Codex 正在等待批准".to_string(),
+        event: event.to_string(),
+        summary: summary.to_string(),
         detail: String::new(),
         updated_at: now_timestamp(),
         ttl_ms: 0,
@@ -434,16 +510,43 @@ pub fn read_status_from_dir(root: &Path) -> StatusPayload {
 }
 
 pub fn read_effective_status_from_dirs(root: &Path, sessions_root: &Path) -> StatusPayload {
-    let payload = read_status_from_dir(root);
-    if is_priority_status(&payload.status) || is_fresh_done(&payload) {
-        return payload;
-    }
+    read_effective_statuses_from_dirs(root, sessions_root).aggregate
+}
 
-    match latest_codex_session_status(sessions_root) {
-        CodexSessionStatus::Waiting => waiting_from_codex_session(),
-        CodexSessionStatus::Interrupted => interrupted_from_codex_session(),
-        CodexSessionStatus::Running => running_from_codex_session(),
-        CodexSessionStatus::Idle => payload,
+pub fn read_effective_statuses_from_dirs(root: &Path, sessions_root: &Path) -> MultiStatusPayload {
+    read_effective_statuses_from_dirs_with_ttl(
+        root,
+        sessions_root,
+        DEFAULT_ACTIVE_SESSION_TTL,
+        DEFAULT_SESSION_RUNNING_TTL,
+    )
+}
+
+pub fn read_effective_statuses_from_dirs_with_ttl(
+    root: &Path,
+    sessions_root: &Path,
+    active_ttl: Duration,
+    running_ttl: Duration,
+) -> MultiStatusPayload {
+    let payload = read_status_from_dir(root);
+    let mut instances = active_codex_session_instances(sessions_root, active_ttl, running_ttl);
+    let bridge_statuses = read_bridge_status_files(root, active_ttl);
+    apply_bridge_statuses(&mut instances, &bridge_statuses);
+
+    let instance_aggregate = aggregate_instance_statuses(&instances);
+    let aggregate = if instances.len() > 1 {
+        instance_aggregate
+    } else if is_priority_status(&payload.status) || is_fresh_done(&payload) {
+        payload
+    } else if instance_aggregate.status == "idle" {
+        payload
+    } else {
+        instance_aggregate
+    };
+
+    MultiStatusPayload {
+        aggregate,
+        instances,
     }
 }
 
@@ -460,11 +563,20 @@ fn is_fresh_done(payload: &StatusPayload) -> bool {
     (0..DONE_SETTLE_MS).contains(&age_ms)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WaitKind {
+    /// 等待用户批准权限（如沙箱升级请求）
+    #[default]
+    Approval,
+    /// 等待用户回答问题（如 Codex 计划模式提问 / Claude Code AskUserQuestion）
+    Question,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexSessionStatus {
     Idle,
     Running,
-    Waiting,
+    Waiting(WaitKind),
     Interrupted,
 }
 
@@ -472,66 +584,104 @@ enum CodexSessionStatus {
 // 无缓存时每次轮询都要全量读取并逐行解析整个文件，成本随文件增长线性上升；
 // 有缓存后：文件未变化直接复用结果，追加时只解析新增字节，成本只与增量成正比。
 struct SessionParseCache {
-    path: PathBuf,
     size: u64,
     modified: SystemTime,
+    id: String,
+    label: String,
+    cwd: String,
     /// 已解析到最后一个完整行行尾的字节偏移（结尾的半行等补全后再解析）
     consumed: u64,
     /// 跨轮询延续的 turn 状态机
     turn: CodexTurnState,
 }
 
-static SESSION_PARSE_CACHE: Mutex<Option<SessionParseCache>> = Mutex::new(None);
-
-fn latest_codex_session_status(sessions_root: &Path) -> CodexSessionStatus {
-    let Some((path, modified, size)) = latest_codex_session_file(sessions_root) else {
-        return CodexSessionStatus::Idle;
-    };
-
-    match cached_session_status(&path, modified, size) {
-        CodexSessionStatus::Running if !session_file_is_recent(modified) => {
-            CodexSessionStatus::Idle
-        }
-        status => status,
-    }
+#[derive(Debug, Clone)]
+struct SessionStatusSnapshot {
+    id: String,
+    label: String,
+    cwd: String,
+    status: CodexSessionStatus,
+    modified: SystemTime,
 }
 
-fn cached_session_status(path: &Path, modified: SystemTime, size: u64) -> CodexSessionStatus {
+static SESSION_PARSE_CACHE: LazyLock<Mutex<HashMap<PathBuf, SessionParseCache>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn active_codex_session_instances(
+    sessions_root: &Path,
+    active_ttl: Duration,
+    running_ttl: Duration,
+) -> Vec<InstanceStatus> {
+    let files = active_codex_session_files(sessions_root, active_ttl);
+    let active_paths = files
+        .iter()
+        .map(|(path, _, _)| path.clone())
+        .collect::<Vec<_>>();
+    prune_inactive_session_caches(&active_paths);
+
+    let mut snapshots = files
+        .into_iter()
+        .filter_map(|(path, modified, size)| {
+            cached_session_snapshot(&path, modified, size, running_ttl)
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| right.modified.cmp(&left.modified));
+
+    snapshots
+        .into_iter()
+        .map(|snapshot| {
+            let payload = payload_from_session_status(snapshot.status, snapshot.modified);
+            InstanceStatus {
+                id: snapshot.id,
+                label: snapshot.label,
+                cwd: snapshot.cwd,
+                status: payload.status,
+                summary: payload.summary,
+                detail: payload.detail,
+                updated_at: system_time_timestamp(snapshot.modified),
+                ttl_ms: 0,
+            }
+        })
+        .collect()
+}
+
+fn cached_session_snapshot(
+    path: &Path,
+    modified: SystemTime,
+    size: u64,
+    running_ttl: Duration,
+) -> Option<SessionStatusSnapshot> {
     let mut guard = match SESSION_PARSE_CACHE.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    if let Some(cache) = guard.as_mut() {
-        if cache.path == path {
-            // 文件未变化：直接复用上次的状态机结果
-            if cache.size == size && cache.modified == modified {
-                return turn_state_status(&cache.turn);
-            }
+    if let Some(cache) = guard.get_mut(path) {
+        // 文件未变化：直接复用上次的状态机结果
+        if cache.size == size && cache.modified == modified {
+            return Some(snapshot_from_cache(cache, running_ttl));
+        }
 
-            // 只增长：按追加写处理，从上次偏移继续解析新增行
-            if size > cache.size {
-                if let Some(consumed) =
-                    apply_appended_lines(path, cache.consumed, &mut cache.turn)
-                {
-                    cache.consumed = consumed;
-                    cache.size = size;
-                    cache.modified = modified;
-                    return turn_state_status(&cache.turn);
-                }
+        // 只增长：按追加写处理，从上次偏移继续解析新增行
+        if size > cache.size {
+            if let Some(consumed) = apply_appended_lines(path, cache.consumed, &mut cache.turn) {
+                cache.consumed = consumed;
+                cache.size = size;
+                cache.modified = modified;
+                return Some(snapshot_from_cache(cache, running_ttl));
             }
         }
     }
 
     // 新文件、被截断/重写或增量读取失败：全量重建缓存
     let Ok(content) = fs::read_to_string(path) else {
-        *guard = None;
-        return CodexSessionStatus::Idle;
+        guard.remove(path);
+        return None;
     };
 
+    let (id, label, cwd) = parse_session_identity(path, &content);
     let mut turn = CodexTurnState::default();
     apply_session_content(&content, &mut turn);
-    let status = turn_state_status(&turn);
     // 偏移只推进到最后一个完整行的行尾；结尾的半行等写完后随下次增量一起解析
     let consumed = content
         .as_bytes()
@@ -539,14 +689,46 @@ fn cached_session_status(path: &Path, modified: SystemTime, size: u64) -> CodexS
         .rposition(|&byte| byte == b'\n')
         .map(|index| index + 1)
         .unwrap_or(0) as u64;
-    *guard = Some(SessionParseCache {
-        path: path.to_path_buf(),
+    let cache = SessionParseCache {
         size,
         modified,
+        id,
+        label,
+        cwd,
         consumed,
         turn,
-    });
-    status
+    };
+    let snapshot = snapshot_from_cache(&cache, running_ttl);
+    guard.insert(path.to_path_buf(), cache);
+    Some(snapshot)
+}
+
+fn snapshot_from_cache(
+    cache: &SessionParseCache,
+    running_ttl: Duration,
+) -> SessionStatusSnapshot {
+    let mut status = turn_state_status(&cache.turn);
+    if matches!(status, CodexSessionStatus::Running)
+        && !session_file_is_recent(cache.modified, running_ttl)
+    {
+        status = CodexSessionStatus::Idle;
+    }
+
+    SessionStatusSnapshot {
+        id: cache.id.clone(),
+        label: cache.label.clone(),
+        cwd: cache.cwd.clone(),
+        status,
+        modified: cache.modified,
+    }
+}
+
+fn prune_inactive_session_caches(active_paths: &[PathBuf]) {
+    let mut guard = match SESSION_PARSE_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.retain(|path, _| active_paths.contains(path));
 }
 
 // 从 consumed 偏移读取新增内容并应用到状态机；返回新的已消费偏移。
@@ -567,14 +749,24 @@ fn apply_appended_lines(path: &Path, consumed: u64, turn: &mut CodexTurnState) -
     Some(consumed + complete.len() as u64)
 }
 
-fn session_file_is_recent(modified: SystemTime) -> bool {
+fn session_file_is_recent(modified: SystemTime, running_ttl: Duration) -> bool {
     match SystemTime::now().duration_since(modified) {
-        Ok(age) => age <= SESSION_RUNNING_TTL,
+        Ok(age) => age <= running_ttl,
         Err(_) => true,
     }
 }
 
-fn latest_codex_session_file(sessions_root: &Path) -> Option<(PathBuf, SystemTime, u64)> {
+fn session_file_is_active(modified: SystemTime, active_ttl: Duration) -> bool {
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= active_ttl,
+        Err(_) => true,
+    }
+}
+
+fn active_codex_session_files(
+    sessions_root: &Path,
+    active_ttl: Duration,
+) -> Vec<(PathBuf, SystemTime, u64)> {
     let mut day_dirs = Vec::new();
     for year in read_numeric_dirs(sessions_root) {
         for month in read_numeric_dirs(&year) {
@@ -590,8 +782,9 @@ fn latest_codex_session_file(sessions_root: &Path) -> Option<(PathBuf, SystemTim
     day_dirs
         .into_iter()
         .take(3)
-        .filter_map(latest_jsonl_in_dir)
-        .max_by_key(|(_, modified, _)| *modified)
+        .flat_map(jsonl_files_in_dir)
+        .filter(|(_, modified, _)| session_file_is_active(*modified, active_ttl))
+        .collect()
 }
 
 fn read_numeric_dirs(path: &Path) -> Vec<PathBuf> {
@@ -614,8 +807,11 @@ fn read_numeric_dirs(path: &Path) -> Vec<PathBuf> {
 }
 
 // 返回值带上文件大小，供解析缓存判断"未变化 / 追加 / 截断"
-fn latest_jsonl_in_dir(dir: PathBuf) -> Option<(PathBuf, SystemTime, u64)> {
-    let entries = fs::read_dir(dir).ok()?;
+fn jsonl_files_in_dir(dir: PathBuf) -> Vec<(PathBuf, SystemTime, u64)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
     entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -625,7 +821,227 @@ fn latest_jsonl_in_dir(dir: PathBuf) -> Option<(PathBuf, SystemTime, u64)> {
             let modified = metadata.modified().ok()?;
             Some((path, modified, metadata.len()))
         })
-        .max_by_key(|(_, modified, _)| *modified)
+        .collect()
+}
+
+fn parse_session_identity(path: &Path, content: &str) -> (String, String, String) {
+    let fallback_id = uuid_from_filename(path).unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("codex-session")
+            .to_string()
+    });
+    let Some(first_line) = content.lines().next() else {
+        let label = fallback_label(path, &fallback_id);
+        return (fallback_id, label, String::new());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(first_line) else {
+        let label = fallback_label(path, &fallback_id);
+        return (fallback_id, label, String::new());
+    };
+
+    let cwd = string_at(&value, &["payload", "cwd"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let id = string_at(&value, &["payload", "id"])
+        .or_else(|| string_at(&value, &["payload", "session_id"]))
+        .or_else(|| string_at(&value, &["payload", "thread_id"]))
+        .map(str::to_string)
+        .unwrap_or(fallback_id);
+    let label = label_from_cwd(&cwd).unwrap_or_else(|| fallback_label(path, &id));
+    (id, label, cwd)
+}
+
+fn uuid_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    for start in 0..stem.len().saturating_sub(35) {
+        let candidate = stem.get(start..start + 36)?;
+        if is_uuid_like(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(index, ch)| match index {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        })
+}
+
+fn label_from_cwd(cwd: &str) -> Option<String> {
+    cwd.trim()
+        .trim_end_matches(['\\', '/'])
+        .rsplit(['\\', '/'])
+        .find(|part| !part.is_empty())
+        .map(str::to_string)
+}
+
+fn fallback_label(path: &Path, id: &str) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn payload_from_session_status(status: CodexSessionStatus, modified: SystemTime) -> StatusPayload {
+    let mut payload = match status {
+        CodexSessionStatus::Waiting(kind) => waiting_from_codex_session(kind),
+        CodexSessionStatus::Interrupted => interrupted_from_codex_session(),
+        CodexSessionStatus::Running => running_from_codex_session(),
+        CodexSessionStatus::Idle => idle_with_summary("无活动"),
+    };
+    payload.updated_at = system_time_timestamp(modified);
+    payload
+}
+
+fn system_time_timestamp(time: SystemTime) -> String {
+    OffsetDateTime::from(time)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| now_timestamp())
+}
+
+fn aggregate_instance_statuses(instances: &[InstanceStatus]) -> StatusPayload {
+    if instances.is_empty() {
+        return idle_with_summary("无活动");
+    }
+    if instances.len() == 1 {
+        let instance = &instances[0];
+        return StatusPayload {
+            status: instance.status.clone(),
+            source: "codex".to_string(),
+            event: String::new(),
+            summary: instance.summary.clone(),
+            detail: instance.detail.clone(),
+            updated_at: instance.updated_at.clone(),
+            ttl_ms: 0,
+        };
+    }
+
+    let status = ["waiting", "error", "interrupted", "running", "done", "idle"]
+        .into_iter()
+        .find(|status| instances.iter().any(|instance| instance.status == *status))
+        .unwrap_or("idle");
+
+    StatusPayload {
+        status: status.to_string(),
+        source: "codex".to_string(),
+        event: String::new(),
+        summary: aggregate_summary(instances),
+        detail: String::new(),
+        updated_at: now_timestamp(),
+        ttl_ms: 0,
+    }
+}
+
+fn aggregate_summary(instances: &[InstanceStatus]) -> String {
+    let mut parts = Vec::new();
+    for (status, label) in [
+        ("running", "运行"),
+        ("waiting", "等待"),
+        ("error", "错误"),
+        ("interrupted", "中断"),
+        ("done", "完成"),
+    ] {
+        let count = instances
+            .iter()
+            .filter(|instance| instance.status == status)
+            .count();
+        if count > 0 {
+            parts.push(format!("{count}{label}"));
+        }
+    }
+
+    if parts.is_empty() {
+        "无活动".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeStatusFile {
+    #[serde(flatten)]
+    payload: StatusPayload,
+    #[serde(default)]
+    instance: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    cwd: String,
+}
+
+fn read_bridge_status_files(root: &Path, active_ttl: Duration) -> Vec<BridgeStatusFile> {
+    let dir = root.join("state").join("status");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter_map(|path| {
+            let content = fs::read_to_string(&path).ok()?;
+            let status = serde_json::from_str::<BridgeStatusFile>(&content).ok()?;
+            if is_known_status(&status.payload.status)
+                && bridge_status_is_active(&status.payload, active_ttl)
+            {
+                Some(status)
+            } else {
+                let _ = fs::remove_file(path);
+                None
+            }
+        })
+        .collect()
+}
+
+fn bridge_status_is_active(payload: &StatusPayload, active_ttl: Duration) -> bool {
+    let Ok(updated_at) = OffsetDateTime::parse(&payload.updated_at, &Rfc3339) else {
+        return true;
+    };
+    let age = OffsetDateTime::now_utc() - updated_at;
+    let age_ms = age.whole_milliseconds();
+    (0..=active_ttl.as_millis() as i128).contains(&age_ms)
+}
+
+fn apply_bridge_statuses(instances: &mut [InstanceStatus], bridge_statuses: &[BridgeStatusFile]) {
+    for instance in instances {
+        let Some(status) = bridge_statuses
+            .iter()
+            .filter(|status| bridge_matches_instance(status, instance))
+            .max_by_key(|status| bridge_status_timestamp(&status.payload))
+        else {
+            continue;
+        };
+
+        if is_priority_status(&status.payload.status) || is_fresh_done(&status.payload) {
+            instance.status = status.payload.status.clone();
+            instance.summary = status.payload.summary.clone();
+            instance.detail = status.payload.detail.clone();
+            instance.updated_at = status.payload.updated_at.clone();
+        }
+    }
+}
+
+fn bridge_status_timestamp(payload: &StatusPayload) -> i128 {
+    OffsetDateTime::parse(&payload.updated_at, &Rfc3339)
+        .map(|value| value.unix_timestamp_nanos())
+        .unwrap_or(i128::MIN)
+}
+
+fn bridge_matches_instance(status: &BridgeStatusFile, instance: &InstanceStatus) -> bool {
+    let instance_key = status.instance.trim();
+    let id = status.id.trim();
+    let cwd = status.cwd.trim();
+
+    (!instance_key.is_empty() && instance_key == instance.id)
+        || (!id.is_empty() && id == instance.id)
+        || (!cwd.is_empty() && cwd == instance.cwd)
 }
 
 #[derive(Default)]
@@ -637,6 +1053,8 @@ struct CodexTurnState {
     completed: bool,
     waiting: bool,
     waiting_call_id: Option<String>,
+    /// 等待类型：区分"批准"和"提问"
+    waiting_kind: WaitKind,
     interrupted: bool,
 }
 
@@ -674,7 +1092,7 @@ fn turn_state_status(turn: &CodexTurnState) -> CodexSessionStatus {
     } else if turn.interrupted {
         CodexSessionStatus::Interrupted
     } else if turn.waiting {
-        CodexSessionStatus::Waiting
+        CodexSessionStatus::Waiting(turn.waiting_kind)
     } else if turn.started || turn.activity {
         CodexSessionStatus::Running
     } else {
@@ -705,7 +1123,7 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
         // 中断状态最优先，且不可被其他状态覆盖
         if is_interrupted_event(payload_type) {
             turn.interrupted = true;
-            turn.waiting = false;  // 清除等待状态
+            turn.waiting = false; // 清除等待状态
             turn.activity = false; // 清除活动状态
             return;
         }
@@ -718,7 +1136,9 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
         }
 
         // 最终消息标记完成
-        if payload_type == "agent_message" && string_at(value, &["payload", "phase"]) == Some("final_answer") {
+        if payload_type == "agent_message"
+            && string_at(value, &["payload", "phase"]) == Some("final_answer")
+        {
             turn.final_message = true;
             turn.activity = false; // 已发送最终答案，活动结束
             return;
@@ -727,6 +1147,7 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
         // 权限请求只在未中断时生效
         if !turn.interrupted && is_permission_request_event(value, payload_type) {
             turn.waiting = true;
+            turn.waiting_kind = WaitKind::Approval;
             return;
         }
 
@@ -756,6 +1177,12 @@ fn apply_session_event(value: &Value, turn: &mut CodexTurnState) {
             if contains_required_escalation(value) || is_user_interaction_tool(value) {
                 turn.waiting = true;
                 turn.waiting_call_id = extract_call_id(value).map(str::to_string);
+                // 区分等待类型：用户交互工具 → 提问，纯权限升级 → 批准
+                turn.waiting_kind = if is_user_interaction_tool(value) {
+                    WaitKind::Question
+                } else {
+                    WaitKind::Approval
+                };
             }
         }
         "function_call_output" | "custom_tool_call_output" => {
@@ -837,23 +1264,19 @@ fn contains_required_escalation(value: &Value) -> bool {
     }
 }
 
-// 检测需要用户交互的工具调用
-// 用于识别 AskUserQuestion 等需要用户输入的工具
+// 需要用户交互的工具名白名单：
+// - request_user_input: Codex CLI 计划模式提问（真实 jsonl 中确认的名字）
+// - AskUserQuestion:    Claude Code 的提问工具（保留兼容）
 fn is_user_interaction_tool(value: &Value) -> bool {
-    // 检查工具名称是否为 AskUserQuestion
-    if let Some(tool_name) = string_at(value, &["payload", "name"]) {
-        if tool_name == "AskUserQuestion" {
-            return true;
+    const INTERACTION_TOOLS: [&str; 2] = ["request_user_input", "AskUserQuestion"];
+
+    for field in [&["payload", "name"], &["payload", "function_name"]] {
+        if let Some(name) = string_at(value, field) {
+            if INTERACTION_TOOLS.contains(&name) {
+                return true;
+            }
         }
     }
-
-    // 也检查 function_name 字段（某些版本可能使用这个字段）
-    if let Some(function_name) = string_at(value, &["payload", "function_name"]) {
-        if function_name == "AskUserQuestion" {
-            return true;
-        }
-    }
-
     false
 }
 
@@ -888,28 +1311,49 @@ pub fn read_recent_events_from_dir(root: &Path, limit: usize) -> Vec<EventPayloa
 // 状态轮询热路径：一次调用解析出两个扫描根目录。
 // 之前 project_root() 与 codex_sessions_root() 各自读取并解析一遍 settings.json，
 // 每次轮询多出两次磁盘读取；这里合并为最多读一次。
-fn status_scan_roots() -> (PathBuf, PathBuf) {
+fn status_scan_roots() -> (PathBuf, PathBuf, AppSettings) {
     let env_state = std::env::var("INDICATOR_STATE_DIR").ok().map(PathBuf::from);
     let env_sessions = std::env::var("CODEX_SESSIONS_DIR").ok().map(PathBuf::from);
-
-    // 两个目录都被环境变量覆盖时，无需读设置文件
-    if let (Some(state), Some(sessions)) = (env_state.as_ref(), env_sessions.as_ref()) {
-        return (state.clone(), sessions.clone());
-    }
 
     let app_root = app_data_root();
     let settings = read_settings_from_dir(&app_root).settings;
     (
         env_state.unwrap_or_else(|| resolve_state_dir(&app_root, &settings)),
         env_sessions.unwrap_or_else(|| resolve_codex_sessions_dir(&settings)),
+        settings,
     )
+}
+
+fn active_window_ttl(settings: &AppSettings) -> Duration {
+    Duration::from_secs(u64::from(settings.instance_active_window_minutes.clamp(1, 60)) * 60)
+}
+
+fn running_ttl(settings: &AppSettings) -> Duration {
+    Duration::from_secs(u64::from(settings.session_running_ttl_seconds.clamp(30, 1_800)))
 }
 
 // async：让文件扫描与解析跑在 tauri 异步线程池，避免同步命令阻塞主线程导致 UI 卡顿
 #[tauri::command]
 async fn get_status() -> StatusPayload {
-    let (state_root, sessions_root) = status_scan_roots();
-    read_effective_status_from_dirs(&state_root, &sessions_root)
+    let (state_root, sessions_root, settings) = status_scan_roots();
+    read_effective_statuses_from_dirs_with_ttl(
+        &state_root,
+        &sessions_root,
+        active_window_ttl(&settings),
+        running_ttl(&settings),
+    )
+    .aggregate
+}
+
+#[tauri::command]
+async fn get_statuses() -> MultiStatusPayload {
+    let (state_root, sessions_root, settings) = status_scan_roots();
+    read_effective_statuses_from_dirs_with_ttl(
+        &state_root,
+        &sessions_root,
+        active_window_ttl(&settings),
+        running_ttl(&settings),
+    )
 }
 
 #[tauri::command]
@@ -1152,6 +1596,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_statuses,
             get_recent_events,
             get_settings,
             save_settings,

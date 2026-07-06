@@ -46,6 +46,25 @@ function readStatus(projectRoot) {
   );
 }
 
+function readInstanceStatuses(projectRoot) {
+  const statusDir = path.join(projectRoot, "state", "status");
+  return fs
+    .readdirSync(statusDir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => ({
+      name,
+      value: JSON.parse(fs.readFileSync(path.join(statusDir, name), "utf8")),
+    }));
+}
+
+function readEvents(projectRoot) {
+  return fs
+    .readFileSync(path.join(projectRoot, "state", "events.jsonl"), "utf8")
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => JSON.parse(line));
+}
+
 function readLog(projectRoot) {
   const logPath = path.join(projectRoot, "logs", "indicator.log");
   return fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
@@ -97,4 +116,47 @@ test("unknown non-json notify argument does not write status or log error", () =
 
   assert.equal(fs.existsSync(path.join(projectRoot, "state", "status.json")), false);
   assert.doesNotMatch(readLog(projectRoot), /bridge failed|Invalid JSON primitive/);
+});
+
+test("different cwd events write separate instance statuses and event metadata", () => {
+  const projectRoot = tempProjectRoot("instances");
+  const cwdA = "D:\\Code\\ProjectA";
+  const cwdB = "D:\\Code\\ProjectB";
+
+  runBridge(
+    projectRoot,
+    [],
+    JSON.stringify({
+      hook_event_name: "PermissionRequest",
+      cwd: cwdA,
+      tool_input: { command: "npm test" },
+    }),
+  );
+  runBridge(
+    projectRoot,
+    [],
+    JSON.stringify({
+      hook_event_name: "Stop",
+      cwd: cwdB,
+    }),
+  );
+
+  const statuses = readInstanceStatuses(projectRoot);
+  assert.equal(statuses.length, 2);
+  assert.deepEqual(
+    statuses.map(({ value }) => value.cwd).sort(),
+    [cwdA, cwdB].sort(),
+  );
+  assert.deepEqual(
+    statuses.map(({ value }) => value.status).sort(),
+    ["done", "waiting"].sort(),
+  );
+
+  const events = readEvents(projectRoot);
+  assert.equal(events.length, 2);
+  assert.equal(events[0].cwd, cwdA);
+  assert.equal(events[1].cwd, cwdB);
+  assert.ok(events[0].instance);
+  assert.ok(events[1].instance);
+  assert.notEqual(events[0].instance, events[1].instance);
 });

@@ -178,9 +178,17 @@ export function renderSettingsPage(app: HTMLDivElement) {
       codexSessionsDirMode: value("codexSessionsDirMode"),
       codexSessionsDir: value("codexSessionsDir"),
       pollIntervalMs: value("pollIntervalMs"),
+      instanceActiveWindowMinutes: value("instanceActiveWindowMinutes"),
+      sessionRunningTtlSeconds: value("sessionRunningTtlSeconds"),
+      showInstanceList: checkbox("showInstanceList"),
+      eventInstancePrefix: checkbox("eventInstancePrefix"),
       notifyOnWaiting: checkbox("notifyOnWaiting"),
       notifyOnError: checkbox("notifyOnError"),
       showDoneSettleMs: value("showDoneSettleMs"),
+      runningBreathEnabled: checkbox("runningBreathEnabled"),
+      runningBreathPeriodMs: value("runningBreathPeriodMs"),
+      statusBlinkEnabled: checkbox("statusBlinkEnabled"),
+      statusBlinkCount: value("statusBlinkCount"),
     });
   }
 

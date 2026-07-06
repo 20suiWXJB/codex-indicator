@@ -16,9 +16,24 @@ export interface AppSettings {
   codexSessionsDirMode: PathModeSetting;
   codexSessionsDir: string;
   pollIntervalMs: number;
+  instanceActiveWindowMinutes: number;
+  /** session 文件多少秒内有写入才算"运行中"，超时降级为空闲 */
+  sessionRunningTtlSeconds: number;
+  /** 展开面板顶部是否显示活跃实例列表 */
+  showInstanceList: boolean;
+  /** 最近事件行是否加"项目名:"前缀 */
+  eventInstancePrefix: boolean;
   notifyOnWaiting: boolean;
   notifyOnError: boolean;
   showDoneSettleMs: number;
+  /** 运行中呼吸灯开关 */
+  runningBreathEnabled: boolean;
+  /** 呼吸一次完整周期(ms)，越小越急促 */
+  runningBreathPeriodMs: number;
+  /** 状态切换闪烁开关 */
+  statusBlinkEnabled: boolean;
+  /** 闪烁次数 */
+  statusBlinkCount: number;
 }
 
 export interface SettingsDiagnostics {
@@ -80,9 +95,17 @@ export const DEFAULT_SETTINGS: AppSettings = {
   codexSessionsDirMode: "auto",
   codexSessionsDir: "",
   pollIntervalMs: 500,
+  instanceActiveWindowMinutes: 10,
+  sessionRunningTtlSeconds: 120,
+  showInstanceList: true,
+  eventInstancePrefix: true,
   notifyOnWaiting: true,
   notifyOnError: true,
   showDoneSettleMs: 3500,
+  runningBreathEnabled: true,
+  runningBreathPeriodMs: 2400,
+  statusBlinkEnabled: true,
+  statusBlinkCount: 3,
 };
 
 const LANGUAGE_OPTIONS: SettingOption[] = [
@@ -184,7 +207,7 @@ export const SETTING_SECTIONS: SettingSection[] = [
       {
         key: "stateDir",
         title: "状态目录",
-        description: "自定义状态目录时，应用会在该目录下读取 state/status.json 和 state/events.jsonl。",
+        description: "自定义状态目录时，应用会在该目录下读取 state/status.json、state/status/*.json 和 state/events.jsonl。",
         compatibility: "留空时自动模式生效；路径必须是当前系统可访问的本地路径。",
         input: "path",
       },
@@ -213,6 +236,48 @@ export const SETTING_SECTIONS: SettingSection[] = [
         max: 10000,
         step: 50,
         unit: "ms",
+      },
+    ],
+  },
+  {
+    id: "instances",
+    title: "多实例",
+    items: [
+      {
+        key: "instanceActiveWindowMinutes",
+        title: "实例活跃窗口",
+        description: "控制最近多少分钟内有活动的 Codex 会话会显示为一个实例。",
+        compatibility: "建议保持 1-60 分钟；过短可能让暂时停顿的实例消失，过长会保留更多历史会话。",
+        input: "number",
+        min: 1,
+        max: 60,
+        step: 1,
+        unit: "分钟",
+      },
+      {
+        key: "sessionRunningTtlSeconds",
+        title: "运行判定窗口",
+        description: "控制 session 文件多少秒内有写入才算运行中，超过后降级为空闲。",
+        compatibility: "只影响 Codex sessions 推断链路；bridge 写入的状态文件仍沿用自身语义。",
+        input: "number",
+        min: 30,
+        max: 1800,
+        step: 30,
+        unit: "秒",
+      },
+      {
+        key: "showInstanceList",
+        title: "显示实例列表",
+        description: "展开主面板时在最近事件上方显示活跃 Codex 实例列表。",
+        compatibility: "关闭后不影响聚合状态和最近事件，只减少展开面板里的实例占位。",
+        input: "toggle",
+      },
+      {
+        key: "eventInstancePrefix",
+        title: "事件行实例前缀",
+        description: "在最近事件文本前显示项目名，便于多实例同时运行时区分来源。",
+        compatibility: "关闭后事件内容保持原文显示，事件文件中的实例信息不会被删除。",
+        input: "toggle",
       },
     ],
   },
@@ -248,13 +313,55 @@ export const SETTING_SECTIONS: SettingSection[] = [
     ],
   },
   {
+    id: "effects",
+    title: "效果",
+    items: [
+      {
+        key: "runningBreathEnabled",
+        title: "运行中呼吸灯",
+        description: "AI 正在运行时，指示灯呈现透明度与光晕的周期性呼吸效果。",
+        compatibility: "纯 CSS 动画实现，不增加轮询负担；关闭后指示灯保持静态常亮。",
+        input: "toggle",
+      },
+      {
+        key: "runningBreathPeriodMs",
+        title: "呼吸周期",
+        description: "呼吸灯完成一次明暗循环的时间，数值越小节奏越急促。",
+        compatibility: "仅影响运行中状态的呼吸节奏，其他状态不受影响。",
+        input: "number",
+        min: 800,
+        max: 6000,
+        step: 200,
+        unit: "ms",
+      },
+      {
+        key: "statusBlinkEnabled",
+        title: "状态切换闪烁",
+        description: "AI 状态发生变化时（如等待→运行中），指示灯快速闪烁提醒你注意。",
+        compatibility: "闪烁是一次性动画，完成后自动恢复当前状态对应的静态或呼吸效果。",
+        input: "toggle",
+      },
+      {
+        key: "statusBlinkCount",
+        title: "闪烁次数",
+        description: "状态变化时指示灯快速闪烁的次数，建议 2~5 次。",
+        compatibility: "仅在状态切换闪烁开启时生效；不影响运行中呼吸灯等其他动效。",
+        input: "number",
+        min: 1,
+        max: 10,
+        step: 1,
+        unit: "次",
+      },
+    ],
+  },
+  {
     id: "privacy",
     title: "数据与隐私",
     items: [
       {
         action: "openStateDir",
         title: "打开状态目录",
-        description: "打开当前状态文件目录，便于检查 status.json 和 events.jsonl。",
+        description: "打开当前状态文件目录，便于检查 status.json、status/*.json 和 events.jsonl。",
         compatibility: "使用系统默认文件管理器；路径来自当前设置解析结果。",
       },
       {
@@ -323,6 +430,20 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     ),
     codexSessionsDir: stringValue(source.codexSessionsDir, DEFAULT_SETTINGS.codexSessionsDir),
     pollIntervalMs: numberValue(source.pollIntervalMs, DEFAULT_SETTINGS.pollIntervalMs, 250, 10000),
+    instanceActiveWindowMinutes: numberValue(
+      source.instanceActiveWindowMinutes,
+      DEFAULT_SETTINGS.instanceActiveWindowMinutes,
+      1,
+      60,
+    ),
+    sessionRunningTtlSeconds: numberValue(
+      source.sessionRunningTtlSeconds,
+      DEFAULT_SETTINGS.sessionRunningTtlSeconds,
+      30,
+      1800,
+    ),
+    showInstanceList: boolValue(source.showInstanceList, DEFAULT_SETTINGS.showInstanceList),
+    eventInstancePrefix: boolValue(source.eventInstancePrefix, DEFAULT_SETTINGS.eventInstancePrefix),
     notifyOnWaiting: boolValue(source.notifyOnWaiting, DEFAULT_SETTINGS.notifyOnWaiting),
     notifyOnError: boolValue(source.notifyOnError, DEFAULT_SETTINGS.notifyOnError),
     showDoneSettleMs: numberValue(
@@ -330,6 +451,20 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
       DEFAULT_SETTINGS.showDoneSettleMs,
       500,
       30000,
+    ),
+    runningBreathEnabled: boolValue(source.runningBreathEnabled, DEFAULT_SETTINGS.runningBreathEnabled),
+    runningBreathPeriodMs: numberValue(
+      source.runningBreathPeriodMs,
+      DEFAULT_SETTINGS.runningBreathPeriodMs,
+      800,
+      6000,
+    ),
+    statusBlinkEnabled: boolValue(source.statusBlinkEnabled, DEFAULT_SETTINGS.statusBlinkEnabled),
+    statusBlinkCount: numberValue(
+      source.statusBlinkCount,
+      DEFAULT_SETTINGS.statusBlinkCount,
+      1,
+      10,
     ),
   };
 }
@@ -352,7 +487,14 @@ export function formatSettingValue(key: keyof AppSettings, settings: AppSettings
       return `${value}px`;
     case "pollIntervalMs":
     case "showDoneSettleMs":
+    case "runningBreathPeriodMs":
       return `${value}ms`;
+    case "instanceActiveWindowMinutes":
+      return `${value}分钟`;
+    case "sessionRunningTtlSeconds":
+      return `${value}秒`;
+    case "statusBlinkCount":
+      return `${value}次`;
     default:
       return value ? "开启" : "关闭";
   }

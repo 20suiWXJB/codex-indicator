@@ -134,6 +134,7 @@ button {
 .panel {
   display: none;
   max-height: 214px;
+  overflow: hidden;
   margin-top: 8px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 8px;
@@ -157,6 +158,76 @@ button {
   font-weight: 700;
 }
 
+.instances {
+  max-height: 74px;
+  margin: 0;
+  padding: 6px 8px 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.instance {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-height: 24px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(238, 242, 247, 0.76);
+}
+
+.instance:first-child {
+  border-top: 0;
+}
+
+.instance-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #68707a;
+}
+
+.instance-name,
+.instance-state {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.instance-name {
+  min-width: 0;
+}
+
+.instance-state {
+  max-width: 54px;
+  color: rgba(238, 242, 247, 0.58);
+  font-size: 11px;
+}
+
+.instance-dot[data-status="waiting"] {
+  background: #f4c95d;
+}
+
+.instance-dot[data-status="running"] {
+  background: #63b3ff;
+}
+
+.instance-dot[data-status="done"] {
+  background: #73d38c;
+}
+
+.instance-dot[data-status="error"] {
+  background: #ff5a5f;
+}
+
+.instance-dot[data-status="interrupted"] {
+  background: #ff8a62;
+}
+
+.instance-empty {
+  padding: 0;
+}
+
 .text-button {
   height: 24px;
   padding: 0 8px;
@@ -165,7 +236,7 @@ button {
 }
 
 .events {
-  max-height: 164px;
+  max-height: 96px;
   margin: 0;
   padding: 0 8px 8px;
   overflow: auto;
@@ -274,6 +345,55 @@ button {
   }
   50% {
     opacity: 0.38;
+  }
+}
+
+/* ===== 呼吸灯动画（运行中状态） ===== */
+/* 通过 opacity + box-shadow 周期性变化，模拟"呼吸"的生命感 */
+@keyframes lamp-breath {
+  0%,
+  100% {
+    opacity: 0.6;
+    box-shadow: 0 0 0 4px rgba(99, 179, 255, 0.12), 0 0 10px rgba(99, 179, 255, 0.24);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 0 7px rgba(99, 179, 255, 0.22), 0 0 22px rgba(99, 179, 255, 0.52);
+  }
+}
+
+/* 仅在 shell 标记 data-breath="on" 且指示灯为 running 状态时启用呼吸动画 */
+.shell[data-breath="on"] .lamp[data-status="running"] {
+  animation: lamp-breath var(--breath-period, 2400ms) ease-in-out infinite;
+}
+
+/* ===== 状态切换闪烁动画 ===== */
+@keyframes lamp-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+
+/* 闪烁动画播放期间覆盖 running 呼吸动画，结束后由 animationend 恢复 */
+.shell[data-breath="on"] .lamp.status-blink[data-status],
+.lamp.status-blink[data-status] {
+  animation: lamp-blink 0.28s ease-in-out var(--blink-count, 3);
+}
+
+/* ===== 无障碍：尊重系统减少动效偏好 ===== */
+@media (prefers-reduced-motion: reduce) {
+  .lamp[data-status="running"],
+  .lamp[data-status="connecting"],
+  .lamp[data-status="error"],
+  .shell[data-breath="on"] .lamp[data-status="running"],
+  .shell[data-breath="on"] .lamp.status-blink[data-status],
+  .lamp.status-blink,
+  .lamp.status-blink[data-status] {
+    animation: none;
   }
 }
 
