@@ -12,6 +12,8 @@
 
 ![indicator 截图](img/img.png)
 
+![indicator 设置页面](img/img_1.png)
+
 ## 功能亮点
 
 - **悬浮小窗**：默认 220px 宽，透明、置顶、跳过任务栏，适合放在屏幕边缘观察状态。
