@@ -43,6 +43,8 @@ fn partial_settings_json_merges_with_defaults() {
     assert_eq!(result.settings.show_instance_list, true);
     assert_eq!(result.settings.event_instance_prefix, true);
     assert_eq!(result.settings.panel_expanded_height, 300);
+    assert_eq!(result.settings.edge_dock_enabled, true);
+    assert_eq!(result.settings.dock_hide_delay_ms, 600);
 }
 
 #[test]
@@ -105,6 +107,38 @@ fn multi_instance_settings_are_normalized_and_persisted() {
     assert!(saved_content.contains("\"sessionRunningTtlSeconds\": 30"));
     assert!(saved_content.contains("\"showInstanceList\": false"));
     assert!(saved_content.contains("\"eventInstancePrefix\": false"));
+}
+
+#[test]
+fn dock_settings_are_normalized_and_persisted() {
+    let root = temp_config_dir("dock");
+    fs::write(
+        root.join("config/settings.json"),
+        r#"{"edgeDockEnabled":false,"dockHideDelayMs":5000}"#,
+    )
+    .expect("write dock settings");
+
+    let result = read_settings_from_dir(&root);
+
+    assert_eq!(result.settings.edge_dock_enabled, false);
+    assert_eq!(result.settings.dock_hide_delay_ms, 3000);
+
+    let settings = AppSettings {
+        edge_dock_enabled: false,
+        dock_hide_delay_ms: 200,
+        ..default_settings()
+    };
+    let saved = save_settings_to_dir(&root, &settings).expect("save settings");
+    let saved_content =
+        fs::read_to_string(root.join("config/settings.json")).expect("read saved settings");
+    let reread = read_settings_from_dir(&root);
+
+    assert_eq!(saved.edge_dock_enabled, false);
+    assert_eq!(saved.dock_hide_delay_ms, 200);
+    assert_eq!(reread.settings.edge_dock_enabled, false);
+    assert_eq!(reread.settings.dock_hide_delay_ms, 200);
+    assert!(saved_content.contains("\"edgeDockEnabled\": false"));
+    assert!(saved_content.contains("\"dockHideDelayMs\": 200"));
 }
 
 #[test]

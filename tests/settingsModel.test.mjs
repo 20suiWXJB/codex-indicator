@@ -47,6 +47,8 @@ test("missing setting fields are completed from defaults", () => {
   assert.equal(settings.sessionRunningTtlSeconds, 120);
   assert.equal(settings.showInstanceList, true);
   assert.equal(settings.eventInstancePrefix, true);
+  assert.equal(settings.edgeDockEnabled, true);
+  assert.equal(settings.dockHideDelayMs, 600);
 });
 
 test("invalid setting values are normalized before save", () => {
@@ -64,6 +66,8 @@ test("invalid setting values are normalized before save", () => {
     showDoneSettleMs: 50,
     showInstanceList: "yes",
     eventInstancePrefix: 1,
+    edgeDockEnabled: "yes",
+    dockHideDelayMs: 5000,
   });
 
   assert.equal(settings.language, "zh-CN");
@@ -77,6 +81,8 @@ test("invalid setting values are normalized before save", () => {
   assert.equal(settings.showDoneSettleMs, 500);
   assert.equal(settings.showInstanceList, true);
   assert.equal(settings.eventInstancePrefix, true);
+  assert.equal(settings.edgeDockEnabled, true);
+  assert.equal(settings.dockHideDelayMs, 3000);
 });
 
 test("every persisted setting has visible explanatory copy", () => {
@@ -164,6 +170,28 @@ test("multi-instance settings have defaults, metadata, and formatting", () => {
   assert.equal(formatSettingValue("sessionRunningTtlSeconds", DEFAULT_SETTINGS), "120秒");
   assert.equal(formatSettingValue("showInstanceList", DEFAULT_SETTINGS), "开启");
   assert.equal(formatSettingValue("eventInstancePrefix", DEFAULT_SETTINGS), "开启");
+});
+
+test("dock settings have defaults, metadata, formatting, and clamp", () => {
+  const { DEFAULT_SETTINGS, SETTING_SECTIONS, formatSettingValue, normalizeSettings } = loadSettingsModel();
+  const windowSection = SETTING_SECTIONS.find((section) => section.id === "window");
+  const edgeDock = windowSection.items.find((item) => item.key === "edgeDockEnabled");
+  const hideDelay = windowSection.items.find((item) => item.key === "dockHideDelayMs");
+
+  assert.equal(DEFAULT_SETTINGS.edgeDockEnabled, true);
+  assert.equal(DEFAULT_SETTINGS.dockHideDelayMs, 600);
+  assert.ok(edgeDock, "edgeDockEnabled should be visible in window settings");
+  assert.ok(hideDelay, "dockHideDelayMs should be visible in window settings");
+  assert.equal(edgeDock.input, "toggle");
+  assert.equal(hideDelay.input, "number");
+  assert.equal(hideDelay.min, 200);
+  assert.equal(hideDelay.max, 3000);
+  assert.equal(hideDelay.step, 100);
+  assert.equal(hideDelay.unit, "ms");
+  assert.equal(formatSettingValue("edgeDockEnabled", DEFAULT_SETTINGS), "开启");
+  assert.equal(formatSettingValue("dockHideDelayMs", DEFAULT_SETTINGS), "600ms");
+  assert.equal(normalizeSettings({ dockHideDelayMs: 100 }).dockHideDelayMs, 200);
+  assert.equal(normalizeSettings({ dockHideDelayMs: 3500 }).dockHideDelayMs, 3000);
 });
 
 test("session running ttl is clamped and invalid values fall back", () => {

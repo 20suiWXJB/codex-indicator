@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { cursorPosition, getCurrentWindow } from "@tauri-apps/api/window";
 import {
   connectingStatus,
   describeStatus,
@@ -18,9 +18,15 @@ import {
   normalizeSettings,
 } from "./settingsModel";
 import type { SettingsSnapshot } from "./settingsModel";
+import { reduceDock } from "./dockModel";
+import type { DockCommand, DockEdge, DockUiState } from "./dockModel";
 
 const OPEN_EVENTS = "indicator-open-events";
 const SETTINGS_CHANGED = "indicator-settings-changed";
+const MOVE_DEBOUNCE_MS = 400;
+const PEEK_DELAY_MS = 120;
+const MOVED_SUPPRESS_MS = 500;
+const DOCK_CURSOR_POLL_MS = 100;
 
 export function renderMainPanel(app: HTMLDivElement) {
   // 视图标记同时挂载到 html 和 body，保持与设置视图一致的挂载点
@@ -42,6 +48,7 @@ export function renderMainPanel(app: HTMLDivElement) {
           <button class="icon-button close" type="button" title="隐藏窗口" aria-label="隐藏窗口">-</button>
         </div>
       </section>
+      <div class="dock-bead" aria-hidden="true" title="AI 状态"><span class="dock-bead-core"></span></div>
       <section class="panel" aria-label="最近事件">
         <ol class="instances" aria-label="活跃实例"></ol>
         <div class="panel-head">
@@ -56,6 +63,8 @@ export function renderMainPanel(app: HTMLDivElement) {
 
   const shell = app.querySelector<HTMLElement>(".shell")!;
   const pill = app.querySelector<HTMLElement>(".pill")!;
+  const dockBead = app.querySelector<HTMLElement>(".dock-bead")!;
+  const dockBeadCore = app.querySelector<HTMLElement>(".dock-bead-core")!;
   const statusButton = app.querySelector<HTMLButtonElement>(".status-button")!;
   const settingsButton = app.querySelector<HTMLButtonElement>(".settings")!;
   const pinButton = app.querySelector<HTMLButtonElement>(".pin")!;
@@ -78,6 +87,21 @@ export function renderMainPanel(app: HTMLDivElement) {
   let lastRenderKey = "";
   /** 上一次实际渲染的状态，用于判断是否需要触发切换闪烁 */
   let prevDisplayStatus: IndicatorStatus | null = null;
+  let dockUi: DockUiState = { mode: "none", edge: null };
+  let moveDebounceTimer: number | undefined;
+  let peekTimer: number | undefined;
+  let hideTimer: number | undefined;
+  let shouldHideWhenSettled = false;
+  let suppressMovedUntil = 0;
+  let dockStateRestored = false;
+  let isNativeDragging = false;
+  let nativeDragReleaseSupported: boolean | undefined;
+  let nativeDragReleaseWaiting = false;
+  let dockCursorPollTimer: number | undefined;
+  let dockCursorPollGeneration = 0;
+  let dockCursorPollInFlight = false;
+  let cursorReadErrorReported = false;
+  let geometryReadErrorReported = false;
 
   function setPanelOpen(open: boolean) {
     panelOpen = open;
@@ -124,8 +148,11 @@ export function renderMainPanel(app: HTMLDivElement) {
     ) {
       // 动画重启技巧：先移除类 → 强制回流 → 重新添加
       lamp.classList.remove("status-blink");
+      dockBeadCore.classList.remove("status-blink");
       void lamp.offsetWidth;
+      void dockBeadCore.offsetWidth;
       lamp.classList.add("status-blink");
+      dockBeadCore.classList.add("status-blink");
     }
     prevDisplayStatus = displayStatus;
 
@@ -133,6 +160,7 @@ export function renderMainPanel(app: HTMLDivElement) {
     lamp.dataset.status = displayStatus;
     label.textContent = copy.label;
     summary.textContent = trimText(aggregateSubtitle, 42);
+    dockBead.title = copy.title;
     statusButton.title = [copy.title, copy.detail, aggregateSubtitle].filter(Boolean).join("\n");
     renderInstances(instances);
   }
@@ -219,9 +247,22 @@ export function renderMainPanel(app: HTMLDivElement) {
     shell.dataset.breath = settings.runningBreathEnabled ? "on" : "off";
     lamp.style.setProperty("--breath-period", `${settings.runningBreathPeriodMs}ms`);
     lamp.style.setProperty("--blink-count", String(settings.statusBlinkCount));
+    dockBeadCore.style.setProperty("--breath-period", `${settings.runningBreathPeriodMs}ms`);
+    dockBeadCore.style.setProperty("--blink-count", String(settings.statusBlinkCount));
 
     pinButton.classList.toggle("active", settings.alwaysOnTop);
     await applyAlwaysOnTop(settings.alwaysOnTop);
+    if (settings.edgeDockEnabled === false) {
+      isNativeDragging = false;
+      if (moveDebounceTimer !== undefined) {
+        window.clearTimeout(moveDebounceTimer);
+        moveDebounceTimer = undefined;
+      }
+      await dispatchDock({ kind: "dockDisabled" });
+      dockStateRestored = true;
+    } else if (!dockStateRestored || dockUi.mode === "none") {
+      await restoreDockState();
+    }
     scheduleStatusPolling();
     if (panelOpen) {
       void resizePanelWindow(true);
@@ -297,7 +338,85 @@ export function renderMainPanel(app: HTMLDivElement) {
     pollTimer = window.setInterval(refreshStatus, settings.pollIntervalMs);
   }
 
-  pill.addEventListener("pointerdown", async (event) => {
+  function updateDockDataset() {
+    shell.dataset.dockMode = dockUi.mode;
+    if (dockUi.edge) {
+      shell.dataset.dockEdge = dockUi.edge;
+    } else {
+      delete shell.dataset.dockEdge;
+    }
+  }
+
+  async function restoreDockState() {
+    try {
+      const state = await invoke<{ edge: DockEdge } | null>("get_dock_state");
+      await dispatchDock({ kind: "restored", state });
+    } catch {
+      await dispatchDock({ kind: "restored", state: null });
+    }
+    dockStateRestored = true;
+  }
+
+  async function dispatchDock(event: Parameters<typeof reduceDock>[1]) {
+    const result = reduceDock(dockUi, event);
+    dockUi = result.state;
+    updateDockDataset();
+    syncDockCursorPolling();
+
+    for (const command of result.commands) {
+      await executeDockCommand(command);
+    }
+  }
+
+  async function executeDockCommand(command: DockCommand) {
+    if (command.kind === "closePanel") {
+      setPanelOpen(false);
+      return;
+    }
+
+    suppressMovedUntil = Date.now() + MOVED_SUPPRESS_MS;
+    try {
+      if (command.kind === "setMode") {
+        await invoke("set_dock_mode", {
+          mode: command.mode,
+          panelExpandedHeight: panelOpen ? settings.panelExpandedHeight : undefined,
+        });
+      } else if (command.kind === "undock") {
+        await invoke("undock_window");
+      }
+    } catch (error) {
+      reportDockError(`dock command ${command.kind} failed`, error);
+      dockUi = { mode: "none", edge: null };
+      updateDockDataset();
+      syncDockCursorPolling();
+    }
+  }
+
+  async function runDockCheck(options: { allowDocked?: boolean } = {}) {
+    if (settings.edgeDockEnabled === false) {
+      return;
+    }
+    if (dockUi.mode !== "none" && options.allowDocked !== true) {
+      return;
+    }
+
+    suppressMovedUntil = Date.now() + MOVED_SUPPRESS_MS;
+    try {
+      if (panelOpen) {
+        setPanelOpen(false);
+        await resizePanelWindow(false);
+      }
+      const edge = await invoke<DockEdge | null>("dock_check", {
+        panelExpandedHeight: undefined,
+      });
+      await dispatchDock({ kind: "dockCheckResult", edge });
+    } catch (error) {
+      reportDockError("dock_check failed", error);
+      await dispatchDock({ kind: "dockCheckResult", edge: null });
+    }
+  }
+
+  async function handleDragPointerDown(event: PointerEvent) {
     if (event.button !== 0) {
       return;
     }
@@ -307,12 +426,304 @@ export function renderMainPanel(app: HTMLDivElement) {
       return;
     }
 
+    isNativeDragging = true;
+    nativeDragReleaseWaiting = true;
+    stopDockCursorPolling();
+    cancelDockTimers();
+    if (moveDebounceTimer !== undefined) {
+      window.clearTimeout(moveDebounceTimer);
+      moveDebounceTimer = undefined;
+    }
+
+    if (panelOpen) {
+      setPanelOpen(false);
+      await resizePanelWindow(false);
+    }
+
+    let releasePromise: Promise<boolean> | undefined;
+    if (await supportsNativeDragRelease()) {
+      releasePromise = invoke<void>("wait_for_native_drag_release").then(
+        () => true,
+        (error) => {
+          reportDockError("native drag release wait failed", error);
+          return false;
+        },
+      ).finally(() => {
+        nativeDragReleaseWaiting = false;
+      });
+    } else {
+      nativeDragReleaseWaiting = false;
+    }
+
+    let dragStarted = false;
     try {
       await getCurrentWindow().startDragging();
-    } catch {
+      dragStarted = true;
+    } catch (error) {
+      isNativeDragging = false;
+      reportDockError("native drag start failed", error);
+      syncDockCursorPolling();
       // Dragging is only available inside the Tauri runtime.
     }
+
+    if (!releasePromise) {
+      return;
+    }
+
+    const released = await releasePromise;
+    if (!dragStarted) {
+      return;
+    }
+    if (!released) {
+      return;
+    }
+
+    isNativeDragging = false;
+    await runDockCheck({ allowDocked: true });
+  }
+
+  async function supportsNativeDragRelease() {
+    if (nativeDragReleaseSupported !== undefined) {
+      return nativeDragReleaseSupported;
+    }
+    try {
+      nativeDragReleaseSupported = await invoke<boolean>("is_native_drag_release_supported");
+    } catch (error) {
+      nativeDragReleaseSupported = false;
+      reportDockError("native drag release capability check failed", error);
+    }
+    return nativeDragReleaseSupported;
+  }
+
+  function cancelDockTimers() {
+    clearPeekTimer();
+    cancelDockHide();
+  }
+
+  function clearPeekTimer() {
+    if (peekTimer !== undefined) {
+      window.clearTimeout(peekTimer);
+      peekTimer = undefined;
+    }
+  }
+
+  function cancelDockHide() {
+    if (hideTimer !== undefined) {
+      window.clearTimeout(hideTimer);
+      hideTimer = undefined;
+    }
+    shouldHideWhenSettled = false;
+  }
+
+  function scheduleDockHide() {
+    if (dockUi.mode !== "peek" || !shouldHideWhenSettled || hideTimer !== undefined) {
+      return;
+    }
+    hideTimer = window.setTimeout(() => {
+      hideTimer = undefined;
+      if (!shouldHideWhenSettled) {
+        return;
+      }
+      shouldHideWhenSettled = false;
+      void dispatchDock({ kind: "pointerLeaveSettled" });
+    }, settings.dockHideDelayMs);
+  }
+
+  function syncDockCursorPolling() {
+    if (!shouldPollDockCursor()) {
+      stopDockCursorPolling();
+      return;
+    }
+    if (dockCursorPollTimer !== undefined) {
+      return;
+    }
+
+    cursorReadErrorReported = false;
+    geometryReadErrorReported = false;
+    const generation = ++dockCursorPollGeneration;
+    dockCursorPollTimer = window.setInterval(() => {
+      void pollDockCursor(generation);
+    }, DOCK_CURSOR_POLL_MS);
+  }
+
+  function stopDockCursorPolling() {
+    dockCursorPollGeneration += 1;
+    if (dockCursorPollTimer !== undefined) {
+      window.clearInterval(dockCursorPollTimer);
+      dockCursorPollTimer = undefined;
+    }
+    dockCursorPollInFlight = false;
+  }
+
+  async function pollDockCursor(generation: number) {
+    if (
+      dockCursorPollInFlight ||
+      generation !== dockCursorPollGeneration ||
+      !shouldPollDockCursor()
+    ) {
+      return;
+    }
+
+    dockCursorPollInFlight = true;
+    try {
+      let cursor;
+      try {
+        cursor = await cursorPosition();
+      } catch (error) {
+        if (!cursorReadErrorReported) {
+          cursorReadErrorReported = true;
+          reportDockError("dock cursor position read failed", error);
+        }
+        return;
+      }
+
+      let position;
+      let size;
+      try {
+        const currentWindow = getCurrentWindow();
+        [position, size] = await Promise.all([
+          currentWindow.outerPosition(),
+          currentWindow.outerSize(),
+        ]);
+      } catch (error) {
+        if (!geometryReadErrorReported) {
+          geometryReadErrorReported = true;
+          reportDockError("dock window geometry read failed", error);
+        }
+        return;
+      }
+
+      if (
+        generation !== dockCursorPollGeneration ||
+        !shouldPollDockCursor()
+      ) {
+        return;
+      }
+
+      const inside =
+        cursor.x >= position.x &&
+        cursor.x < position.x + size.width &&
+        cursor.y >= position.y &&
+        cursor.y < position.y + size.height;
+      if (inside) {
+        cancelDockHide();
+      } else {
+        clearPeekTimer();
+        shouldHideWhenSettled = true;
+        scheduleDockHide();
+      }
+    } finally {
+      if (generation === dockCursorPollGeneration) {
+        dockCursorPollInFlight = false;
+      }
+    }
+  }
+
+  function shouldPollDockCursor() {
+    return dockUi.mode === "peek" && settings.edgeDockEnabled !== false && !isNativeDragging;
+  }
+
+  function reportDockError(message: string, error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`${message}:`, error);
+    void invoke("report_dock_error", { message: `${message}: ${detail}` }).catch(() => {});
+  }
+
+  pill.addEventListener("pointerdown", handleDragPointerDown);
+  dockBead.addEventListener("pointerdown", handleDragPointerDown);
+
+  document.documentElement.addEventListener("mouseenter", () => {
+    cancelDockHide();
+    if (dockUi.mode === "hidden") {
+      peekTimer = window.setTimeout(() => {
+        peekTimer = undefined;
+        void dispatchDock({ kind: "pointerEnter" });
+      }, PEEK_DELAY_MS);
+    }
   });
+
+  document.documentElement.addEventListener("mouseleave", () => {
+    clearPeekTimer();
+    shouldHideWhenSettled = true;
+    scheduleDockHide();
+  });
+
+  try {
+    const currentWindow = getCurrentWindow() as ReturnType<typeof getCurrentWindow> & {
+      onFocusChanged?: (handler: (event: { payload: boolean }) => void) => Promise<unknown>;
+    };
+    if (typeof currentWindow.onFocusChanged === "function") {
+      void currentWindow.onFocusChanged(({ payload: focused }) => {
+        if (!focused) {
+          clearPeekTimer();
+          shouldHideWhenSettled = true;
+          scheduleDockHide();
+        } else {
+          cancelDockHide();
+        }
+      }).catch((error) => {
+        console.warn("window focus listener registration failed:", error);
+      });
+    }
+  } catch (error) {
+    console.warn("window focus listener registration failed:", error);
+  }
+
+  try {
+    void getCurrentWindow().onMoved(() => {
+      if (settings.edgeDockEnabled === false) {
+        isNativeDragging = false;
+        nativeDragReleaseWaiting = false;
+        stopDockCursorPolling();
+        return;
+      }
+
+      if (isNativeDragging) {
+        if (nativeDragReleaseWaiting) {
+          return;
+        }
+        if (moveDebounceTimer !== undefined) {
+          window.clearTimeout(moveDebounceTimer);
+        }
+        moveDebounceTimer = window.setTimeout(async () => {
+          moveDebounceTimer = undefined;
+          if (
+            !isNativeDragging ||
+            nativeDragReleaseWaiting ||
+            settings.edgeDockEnabled === false
+          ) {
+            return;
+          }
+          isNativeDragging = false;
+          await runDockCheck({ allowDocked: true });
+        }, MOVE_DEBOUNCE_MS);
+        return;
+      }
+
+      if (dockUi.mode !== "none" || Date.now() < suppressMovedUntil) {
+        return;
+      }
+      if (moveDebounceTimer !== undefined) {
+        window.clearTimeout(moveDebounceTimer);
+      }
+      moveDebounceTimer = window.setTimeout(async () => {
+        moveDebounceTimer = undefined;
+        if (
+          dockUi.mode !== "none" ||
+          Date.now() < suppressMovedUntil ||
+          settings.edgeDockEnabled === false
+        ) {
+          return;
+        }
+        await runDockCheck();
+      }, MOVE_DEBOUNCE_MS);
+    }).catch((error) => {
+      console.warn("window move listener registration failed:", error);
+    });
+  } catch (error) {
+    console.warn("window move listener registration failed:", error);
+    // Window move events are only available inside the Tauri runtime.
+  }
 
   statusButton.addEventListener("click", () => {
     setPanelOpen(!panelOpen);
@@ -338,12 +749,16 @@ export function renderMainPanel(app: HTMLDivElement) {
   lamp.addEventListener("animationend", (event) => {
     if (event.animationName === "lamp-blink") {
       lamp.classList.remove("status-blink");
+      dockBeadCore.classList.remove("status-blink");
     }
   });
 
   void listen(OPEN_EVENTS, () => {
-    setPanelOpen(true);
-    void resizePanelWindow(true);
+    void (async () => {
+      await dispatchDock({ kind: "pointerEnter" });
+      setPanelOpen(true);
+      await resizePanelWindow(true);
+    })();
   });
   void listen(SETTINGS_CHANGED, () => {
     void loadSettings();

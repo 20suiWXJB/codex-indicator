@@ -1,3 +1,4 @@
+use dock::{detect_dock_edge, dock_geometry, DockEdge, DockMode, DockState, Rect, PILL_H, PILL_W};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -11,9 +12,11 @@ use std::{
 use tauri::{
     menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Emitter, Manager, Monitor, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+pub mod dock;
 
 // 移除硬编码路径，改为运行时检测
 const DONE_SETTLE_MS: i128 = 3500;
@@ -23,6 +26,10 @@ const MAIN_WINDOW: &str = "main";
 const SETTINGS_WINDOW: &str = "settings";
 const OPEN_EVENTS: &str = "indicator-open-events";
 const SETTINGS_CHANGED: &str = "indicator-settings-changed";
+const NATIVE_DRAG_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const NATIVE_DRAG_RELEASE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const NATIVE_DRAG_RELEASE_MAX_POLLS: usize = 1_500;
+static CURRENT_DOCK_MODE: LazyLock<Mutex<Option<DockMode>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +110,10 @@ pub struct AppSettings {
     pub minimize_to_tray: bool,
     #[serde(default = "default_panel_expanded_height")]
     pub panel_expanded_height: u32,
+    #[serde(default = "default_true")]
+    pub edge_dock_enabled: bool,
+    #[serde(default = "default_dock_hide_delay_ms")]
+    pub dock_hide_delay_ms: u32,
     #[serde(default = "default_path_mode")]
     pub state_dir_mode: String,
     #[serde(default)]
@@ -192,6 +203,10 @@ fn default_panel_expanded_height() -> u32 {
     300
 }
 
+fn default_dock_hide_delay_ms() -> u32 {
+    600
+}
+
 fn default_poll_interval_ms() -> u32 {
     500
 }
@@ -225,6 +240,8 @@ pub fn default_settings() -> AppSettings {
         remember_window_state: true,
         minimize_to_tray: true,
         panel_expanded_height: default_panel_expanded_height(),
+        edge_dock_enabled: true,
+        dock_hide_delay_ms: default_dock_hide_delay_ms(),
         state_dir_mode: default_path_mode(),
         state_dir: String::new(),
         codex_sessions_dir_mode: default_path_mode(),
@@ -268,6 +285,10 @@ fn project_root() -> PathBuf {
 
 fn settings_path(root: &Path) -> PathBuf {
     root.join("config").join("settings.json")
+}
+
+fn dock_state_path() -> PathBuf {
+    app_data_root().join("config").join("dock-state.json")
 }
 
 fn resolve_state_dir(app_root: &Path, settings: &AppSettings) -> PathBuf {
@@ -323,6 +344,7 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     settings.state_dir = settings.state_dir.trim().to_string();
     settings.codex_sessions_dir = settings.codex_sessions_dir.trim().to_string();
     settings.panel_expanded_height = settings.panel_expanded_height.clamp(220, 620);
+    settings.dock_hide_delay_ms = settings.dock_hide_delay_ms.clamp(200, 3_000);
     settings.poll_interval_ms = settings.poll_interval_ms.clamp(250, 10_000);
     settings.instance_active_window_minutes = settings.instance_active_window_minutes.clamp(1, 60);
     settings.session_running_ttl_seconds = settings.session_running_ttl_seconds.clamp(30, 1_800);
@@ -471,6 +493,101 @@ fn append_log(root: &Path, message: &str) {
         .open(logs_path(root))
     {
         let _ = writeln!(file, "[{}] {}", now_timestamp(), message);
+    }
+}
+
+fn wait_for_drag_release_with<P, S>(mut is_pressed: P, mut sleep: S, max_polls: usize) -> bool
+where
+    P: FnMut() -> bool,
+    S: FnMut(Duration),
+{
+    for _ in 0..max_polls {
+        if !is_pressed() {
+            sleep(NATIVE_DRAG_RELEASE_SETTLE_DELAY);
+            return true;
+        }
+        sleep(NATIVE_DRAG_RELEASE_POLL_INTERVAL);
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_native_drag_release_inner() -> Result<(), String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+
+    let released = wait_for_drag_release_with(
+        || unsafe { GetAsyncKeyState(VK_LBUTTON as i32) < 0 },
+        std::thread::sleep,
+        NATIVE_DRAG_RELEASE_MAX_POLLS,
+    );
+    if released {
+        Ok(())
+    } else {
+        Err("等待鼠标左键松开超时".to_string())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_native_drag_release_inner() -> Result<(), String> {
+    Err("当前平台不支持原生拖动松手检测".to_string())
+}
+
+#[cfg(test)]
+mod native_drag_release_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn returns_after_immediate_release_and_settle_delay() {
+        let mut sleeps = Vec::new();
+        let released = wait_for_drag_release_with(|| false, |delay| sleeps.push(delay), 3);
+
+        assert!(released);
+        assert_eq!(sleeps, vec![NATIVE_DRAG_RELEASE_SETTLE_DELAY]);
+    }
+
+    #[test]
+    fn polls_while_pressed_then_waits_for_position_to_settle() {
+        let mut states = VecDeque::from([true, true, false]);
+        let mut sleeps = Vec::new();
+        let released = wait_for_drag_release_with(
+            || states.pop_front().unwrap_or(false),
+            |delay| sleeps.push(delay),
+            5,
+        );
+
+        assert!(released);
+        assert_eq!(
+            sleeps,
+            vec![
+                NATIVE_DRAG_RELEASE_POLL_INTERVAL,
+                NATIVE_DRAG_RELEASE_POLL_INTERVAL,
+                NATIVE_DRAG_RELEASE_SETTLE_DELAY,
+            ]
+        );
+    }
+
+    #[test]
+    fn returns_timeout_after_poll_limit() {
+        let mut sleeps = Vec::new();
+        let released = wait_for_drag_release_with(|| true, |delay| sleeps.push(delay), 3);
+
+        assert!(!released);
+        assert_eq!(sleeps, vec![NATIVE_DRAG_RELEASE_POLL_INTERVAL; 3]);
+    }
+
+    #[test]
+    fn reports_platform_support() {
+        assert_eq!(
+            is_native_drag_release_supported(),
+            cfg!(target_os = "windows")
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unsupported_platform_returns_fallback_error() {
+        assert!(wait_for_native_drag_release_inner().is_err());
     }
 }
 
@@ -1332,6 +1449,226 @@ fn running_ttl(settings: &AppSettings) -> Duration {
     Duration::from_secs(u64::from(settings.session_running_ttl_seconds.clamp(30, 1_800)))
 }
 
+fn read_dock_state() -> Option<DockState> {
+    let content = fs::read_to_string(dock_state_path()).ok()?;
+    let state = serde_json::from_str::<DockState>(&content).ok()?;
+    if state.cross.is_finite() {
+        Some(state)
+    } else {
+        None
+    }
+}
+
+fn write_dock_state(state: &DockState) -> Result<(), String> {
+    let path = dock_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    fs::write(path, content).map_err(|error| error.to_string())
+}
+
+fn remove_dock_state() -> Result<(), String> {
+    match fs::remove_file(dock_state_path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn monitor_for_window(window: &WebviewWindow) -> Result<Monitor, String> {
+    if let Some(monitor) = window.current_monitor().map_err(|error| error.to_string())? {
+        return Ok(monitor);
+    }
+    if let Some(monitor) = window.primary_monitor().map_err(|error| error.to_string())? {
+        return Ok(monitor);
+    }
+    Err("无法获取显示器信息".to_string())
+}
+
+fn monitor_for_state(window: &WebviewWindow, state: &DockState) -> Result<Monitor, String> {
+    if let Some(name) = state.monitor.as_deref() {
+        let monitors = window
+            .available_monitors()
+            .map_err(|error| error.to_string())?;
+        if let Some(monitor) = monitors
+            .into_iter()
+            .find(|monitor| monitor.name().map(String::as_str) == Some(name))
+        {
+            return Ok(monitor);
+        }
+    }
+    if let Some(monitor) = window.primary_monitor().map_err(|error| error.to_string())? {
+        return Ok(monitor);
+    }
+    monitor_for_window(window)
+}
+
+fn monitor_work_rect(monitor: &Monitor) -> Rect {
+    let scale = monitor.scale_factor();
+    let work = monitor.work_area();
+    Rect {
+        x: f64::from(work.position.x) / scale,
+        y: f64::from(work.position.y) / scale,
+        w: f64::from(work.size.width) / scale,
+        h: f64::from(work.size.height) / scale,
+    }
+}
+
+fn window_rect(window: &WebviewWindow, monitor: &Monitor) -> Result<Rect, String> {
+    let scale = monitor.scale_factor();
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    Ok(Rect {
+        x: f64::from(position.x) / scale,
+        y: f64::from(position.y) / scale,
+        w: f64::from(size.width) / scale,
+        h: f64::from(size.height) / scale,
+    })
+}
+
+fn rects_close(left: Rect, right: Rect) -> bool {
+    const EPSILON: f64 = 0.5;
+    (left.x - right.x).abs() <= EPSILON
+        && (left.y - right.y).abs() <= EPSILON
+        && (left.w - right.w).abs() <= EPSILON
+        && (left.h - right.h).abs() <= EPSILON
+}
+
+fn apply_window_rect(window: &WebviewWindow, rect: Rect, monitor: &Monitor) -> Result<(), String> {
+    if let Ok(current) = window_rect(window, monitor) {
+        if rects_close(current, rect) {
+            return Ok(());
+        }
+    }
+
+    window
+        .set_size(tauri::LogicalSize::new(rect.w, rect.h))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_position(tauri::LogicalPosition::new(rect.x, rect.y))
+        .map_err(|error| error.to_string())
+}
+
+fn normalized_panel_height(panel_expanded_height: Option<f64>) -> f64 {
+    panel_expanded_height
+        .unwrap_or(default_panel_expanded_height() as f64)
+        .clamp(220.0, 620.0)
+}
+
+fn normalized_dock_peek_height(panel_expanded_height: Option<f64>) -> f64 {
+    panel_expanded_height.unwrap_or(PILL_H).clamp(PILL_H, 620.0)
+}
+
+fn apply_dock_mode(
+    window: &WebviewWindow,
+    state: &DockState,
+    mode: DockMode,
+    panel_expanded_height: Option<f64>,
+) -> Result<(), String> {
+    let monitor = monitor_for_state(window, state)?;
+    let work = monitor_work_rect(&monitor);
+    let height = match mode {
+        DockMode::Hidden => PILL_H,
+        DockMode::Peek => normalized_dock_peek_height(panel_expanded_height),
+    };
+    let rect = dock_geometry(state.edge, mode, state.cross, work, height);
+    apply_window_rect(window, rect, &monitor)?;
+    if let Ok(mut current) = CURRENT_DOCK_MODE.lock() {
+        *current = Some(mode);
+    }
+    append_log(
+        &project_root(),
+        &format!(
+            "dock mode={} edge={}",
+            dock_mode_name(mode),
+            dock_edge_name(state.edge)
+        ),
+    );
+    Ok(())
+}
+
+fn undock_window_inner(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        let _ = remove_dock_state();
+        if let Ok(mut current) = CURRENT_DOCK_MODE.lock() {
+            *current = None;
+        }
+        append_log(&project_root(), "dock mode=undock");
+        return Ok(());
+    };
+
+    let state = read_dock_state();
+    if let Some(state) = state.as_ref() {
+        let monitor = monitor_for_state(&window, state)?;
+        let work = monitor_work_rect(&monitor);
+        let cross_max = work.h - PILL_H;
+        let long_max = work.w - PILL_W;
+        let rect = match state.edge {
+            DockEdge::Left => Rect {
+                x: work.x + dock::BEAD_THICKNESS,
+                y: state.cross.max(work.y).min(work.y + cross_max),
+                w: PILL_W,
+                h: PILL_H,
+            },
+            DockEdge::Right => Rect {
+                x: work.x + work.w - PILL_W - dock::BEAD_THICKNESS,
+                y: state.cross.max(work.y).min(work.y + cross_max),
+                w: PILL_W,
+                h: PILL_H,
+            },
+            DockEdge::Top => Rect {
+                x: state.cross.max(work.x).min(work.x + long_max),
+                y: work.y + dock::BEAD_THICKNESS,
+                w: PILL_W,
+                h: PILL_H,
+            },
+        };
+        apply_window_rect(&window, rect, &monitor)?;
+    } else {
+        window
+            .set_size(tauri::LogicalSize::new(PILL_W, PILL_H))
+            .map_err(|error| error.to_string())?;
+    }
+
+    remove_dock_state()?;
+    if let Ok(mut current) = CURRENT_DOCK_MODE.lock() {
+        *current = None;
+    }
+    append_log(&project_root(), "dock mode=undock");
+    Ok(())
+}
+
+fn dock_edge_name(edge: DockEdge) -> &'static str {
+    match edge {
+        DockEdge::Left => "left",
+        DockEdge::Right => "right",
+        DockEdge::Top => "top",
+    }
+}
+
+fn dock_mode_name(mode: DockMode) -> &'static str {
+    match mode {
+        DockMode::Hidden => "hidden",
+        DockMode::Peek => "peek",
+    }
+}
+
+fn restore_initial_main_geometry(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+
+    if let Some(state) = read_dock_state() {
+        let _ = apply_dock_mode(&window, &state, DockMode::Hidden, None);
+    } else {
+        let _ = window.set_size(tauri::LogicalSize::new(PILL_W, PILL_H));
+        if let Ok(mut current) = CURRENT_DOCK_MODE.lock() {
+            *current = None;
+        }
+    }
+}
+
 // async：让文件扫描与解析跑在 tauri 异步线程池，避免同步命令阻塞主线程导致 UI 卡顿
 #[tauri::command]
 async fn get_status() -> StatusPayload {
@@ -1443,15 +1780,131 @@ fn set_panel_open(
     panel_expanded_height: Option<f64>,
 ) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
-        let expanded_height = panel_expanded_height
-            .unwrap_or(default_panel_expanded_height() as f64)
-            .clamp(220.0, 620.0);
-        let height = if open { expanded_height } else { 72.0 };
-        window
-            .set_size(tauri::LogicalSize::new(220.0, height))
-            .map_err(|error| error.to_string())?;
+        let is_peek = CURRENT_DOCK_MODE
+            .lock()
+            .map(|current| *current == Some(DockMode::Peek))
+            .unwrap_or(false);
+        if is_peek {
+            let state = read_dock_state().ok_or_else(|| "没有可恢复的贴边状态".to_string())?;
+            let height = if open {
+                panel_expanded_height
+            } else {
+                Some(PILL_H)
+            };
+            apply_dock_mode(&window, &state, DockMode::Peek, height)?;
+        } else {
+            let expanded_height = normalized_panel_height(panel_expanded_height);
+            let height = if open { expanded_height } else { PILL_H };
+            window
+                .set_size(tauri::LogicalSize::new(PILL_W, height))
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
+}
+
+#[tauri::command]
+fn dock_check(app: AppHandle, panel_expanded_height: Option<f64>) -> Result<Option<DockEdge>, String> {
+    let _ = panel_expanded_height;
+    let settings = read_settings_from_dir(&app_data_root()).settings;
+    if !settings.edge_dock_enabled {
+        return Ok(None);
+    }
+
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return Ok(None);
+    };
+    let had_dock_state = read_dock_state().is_some();
+    let monitor = monitor_for_window(&window)?;
+    let work = monitor_work_rect(&monitor);
+    let win = window_rect(&window, &monitor)?;
+    let edge = detect_dock_edge(win, work);
+    append_log(
+        &project_root(),
+        &format!(
+            "dock_check window=({:.1},{:.1},{:.1},{:.1}) work=({:.1},{:.1},{:.1},{:.1}) edge={}",
+            win.x,
+            win.y,
+            win.w,
+            win.h,
+            work.x,
+            work.y,
+            work.w,
+            work.h,
+            edge.map(dock_edge_name).unwrap_or("none")
+        ),
+    );
+
+    if let Some(edge) = edge {
+        let cross = match edge {
+            DockEdge::Left | DockEdge::Right => win.y,
+            DockEdge::Top => win.x,
+        };
+        let state = DockState {
+            edge,
+            cross,
+            monitor: monitor.name().cloned(),
+        };
+        write_dock_state(&state)?;
+        Ok(Some(edge))
+    } else {
+        if had_dock_state {
+            remove_dock_state()?;
+        }
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+fn set_dock_mode(
+    app: AppHandle,
+    mode: DockMode,
+    panel_expanded_height: Option<f64>,
+) -> Result<(), String> {
+    let state = read_dock_state().ok_or_else(|| "没有可恢复的贴边状态".to_string())?;
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        apply_dock_mode(&window, &state, mode, panel_expanded_height)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn undock_window(app: AppHandle) -> Result<(), String> {
+    undock_window_inner(&app)
+}
+
+#[tauri::command]
+fn get_dock_state() -> Option<DockState> {
+    read_dock_state()
+}
+
+#[tauri::command]
+fn is_native_drag_release_supported() -> bool {
+    cfg!(target_os = "windows")
+}
+
+#[tauri::command]
+async fn wait_for_native_drag_release() -> Result<(), String> {
+    let root = project_root();
+    append_log(&root, "native drag release monitor started");
+    let result =
+        match tauri::async_runtime::spawn_blocking(wait_for_native_drag_release_inner).await {
+            Ok(result) => result,
+            Err(error) => Err(format!("原生拖动松手检测任务失败: {error}")),
+        };
+    match &result {
+        Ok(()) => append_log(&root, "native drag left button released"),
+        Err(error) => append_log(
+            &root,
+            &format!("native drag release monitor failed: {error}"),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+fn report_dock_error(message: String) {
+    append_log(&project_root(), &format!("dock error: {message}"));
 }
 
 #[tauri::command]
@@ -1462,6 +1915,9 @@ fn quit_app(app: AppHandle) {
 fn apply_runtime_settings(app: &AppHandle, settings: &AppSettings) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
         let _ = window.set_always_on_top(settings.always_on_top);
+    }
+    if !settings.edge_dock_enabled && read_dock_state().is_some() {
+        let _ = undock_window_inner(app);
     }
 }
 
@@ -1487,6 +1943,9 @@ fn open_settings_window_for_app(app: &AppHandle) -> Result<(), String> {
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        if let Some(state) = read_dock_state() {
+            let _ = apply_dock_mode(&window, &state, DockMode::Peek, None);
+        }
         let _ = window.show();
         let _ = window.set_focus();
         let _ = app.emit_to(MAIN_WINDOW, OPEN_EVENTS, ());
@@ -1576,7 +2035,11 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let settings = read_settings_from_dir(&app_data_root()).settings;
@@ -1585,6 +2048,7 @@ pub fn run() {
                 append_log(&root, &format!("初始化目录失败: {}", error));
             }
             apply_runtime_settings(app.handle(), &settings);
+            restore_initial_main_geometry(app.handle());
             if !settings.show_main_window_on_launch {
                 if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
                     let _ = window.hide();
@@ -1608,6 +2072,13 @@ pub fn run() {
             set_always_on_top,
             hide_window,
             set_panel_open,
+            dock_check,
+            set_dock_mode,
+            undock_window,
+            get_dock_state,
+            is_native_drag_release_supported,
+            wait_for_native_drag_release,
+            report_dock_error,
             quit_app
         ])
         .run(tauri::generate_context!())

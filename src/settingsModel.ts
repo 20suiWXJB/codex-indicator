@@ -11,6 +11,8 @@ export interface AppSettings {
   rememberWindowState: boolean;
   minimizeToTray: boolean;
   panelExpandedHeight: number;
+  edgeDockEnabled: boolean;
+  dockHideDelayMs: number;
   stateDirMode: PathModeSetting;
   stateDir: string;
   codexSessionsDirMode: PathModeSetting;
@@ -90,6 +92,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   rememberWindowState: true,
   minimizeToTray: true,
   panelExpandedHeight: 300,
+  edgeDockEnabled: true,
+  dockHideDelayMs: 600,
   stateDirMode: "auto",
   stateDir: "",
   codexSessionsDirMode: "auto",
@@ -189,6 +193,24 @@ export const SETTING_SECTIONS: SettingSection[] = [
         max: 620,
         step: 10,
         unit: "px",
+      },
+      {
+        key: "edgeDockEnabled",
+        title: "贴边收纳",
+        description: "把指示器拖到屏幕左、右或上边缘可收纳成一颗状态灯珠，悬停展开。",
+        compatibility: "关闭时若已收纳会自动恢复普通悬浮；不影响托盘和窗口置顶行为。",
+        input: "toggle",
+      },
+      {
+        key: "dockHideDelayMs",
+        title: "收起延迟",
+        description: "鼠标离开展开的贴边面板后，等待多久收回灯珠。",
+        compatibility: "建议保持 200-3000ms；数值越小越贴近屏幕边缘常驻提示。",
+        input: "number",
+        min: 200,
+        max: 3000,
+        step: 100,
+        unit: "ms",
       },
     ],
   },
@@ -421,6 +443,13 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
       220,
       620,
     ),
+    edgeDockEnabled: boolValue(source.edgeDockEnabled, DEFAULT_SETTINGS.edgeDockEnabled),
+    dockHideDelayMs: numberValue(
+      source.dockHideDelayMs,
+      DEFAULT_SETTINGS.dockHideDelayMs,
+      200,
+      3000,
+    ),
     stateDirMode: enumValue(source.stateDirMode, ["auto", "custom"], DEFAULT_SETTINGS.stateDirMode),
     stateDir: stringValue(source.stateDir, DEFAULT_SETTINGS.stateDir),
     codexSessionsDirMode: enumValue(
@@ -486,6 +515,7 @@ export function formatSettingValue(key: keyof AppSettings, settings: AppSettings
     case "panelExpandedHeight":
       return `${value}px`;
     case "pollIntervalMs":
+    case "dockHideDelayMs":
     case "showDoneSettleMs":
     case "runningBreathPeriodMs":
       return `${value}ms`;

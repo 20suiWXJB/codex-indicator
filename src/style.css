@@ -37,6 +37,45 @@ button {
   min-height: 100vh;
   padding: 8px;
   color: #eef2f7;
+  --status-color: #68707a;
+  --status-ring: rgba(104, 112, 122, 0.16);
+  --status-glow: rgba(104, 112, 122, 0.32);
+}
+
+.shell[data-status="waiting"] {
+  --status-color: #f4c95d;
+  --status-ring: rgba(244, 201, 93, 0.16);
+  --status-glow: rgba(244, 201, 93, 0.48);
+}
+
+.shell[data-status="running"] {
+  --status-color: #63b3ff;
+  --status-ring: rgba(99, 179, 255, 0.16);
+  --status-glow: rgba(99, 179, 255, 0.48);
+}
+
+.shell[data-status="done"] {
+  --status-color: #73d38c;
+  --status-ring: rgba(115, 211, 140, 0.16);
+  --status-glow: rgba(115, 211, 140, 0.46);
+}
+
+.shell[data-status="error"] {
+  --status-color: #ff5a5f;
+  --status-ring: rgba(255, 90, 95, 0.16);
+  --status-glow: rgba(255, 90, 95, 0.54);
+}
+
+.shell[data-status="interrupted"] {
+  --status-color: #ff8a62;
+  --status-ring: rgba(255, 138, 98, 0.16);
+  --status-glow: rgba(255, 138, 98, 0.44);
+}
+
+.shell[data-status="connecting"] {
+  --status-color: #a0a0a0;
+  --status-ring: rgba(160, 160, 160, 0.16);
+  --status-glow: rgba(160, 160, 160, 0.36);
 }
 
 .pill {
@@ -75,8 +114,8 @@ button {
   height: 22px;
   border: 1px solid rgba(255, 255, 255, 0.25);
   border-radius: 50%;
-  background: #68707a;
-  box-shadow: 0 0 0 5px rgba(104, 112, 122, 0.16);
+  background: var(--status-color);
+  box-shadow: 0 0 0 5px var(--status-ring), 0 0 18px var(--status-glow);
 }
 
 .copy {
@@ -145,6 +184,116 @@ button {
 
 .shell[data-panel-open="true"] .panel {
   display: block;
+}
+
+.dock-bead {
+  display: none;
+  width: 100vw;
+  height: 100vh;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(20, 24, 29, 0.82);
+  box-shadow:
+    0 8px 22px rgba(0, 0, 0, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  cursor: move;
+}
+
+.dock-bead-core {
+  width: 6px;
+  height: 28px;
+  border-radius: 3px;
+  background: var(--status-color);
+  box-shadow: 0 0 10px var(--status-color);
+}
+
+@keyframes dock-bead-arrive {
+  0% {
+    opacity: 0;
+    transform: scale(0.72);
+    box-shadow: 0 0 0 var(--status-glow);
+  }
+  65% {
+    opacity: 1;
+    transform: scale(1.06);
+    box-shadow:
+      0 0 18px var(--status-glow),
+      0 8px 22px rgba(0, 0, 0, 0.32),
+      inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow:
+      0 8px 22px rgba(0, 0, 0, 0.32),
+      inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  }
+}
+
+.shell[data-dock-mode="hidden"] {
+  padding: 0;
+}
+
+.shell[data-dock-mode="hidden"] .pill,
+.shell[data-dock-mode="hidden"] .panel,
+.shell[data-dock-mode="hidden"][data-panel-open="true"] .panel {
+  display: none;
+}
+
+.shell[data-dock-mode="hidden"] .dock-bead {
+  display: flex;
+  transform-origin: center;
+  animation: dock-bead-arrive 180ms ease-out both;
+}
+
+.shell[data-dock-edge="right"] .dock-bead {
+  border-right: 0;
+  border-radius: 7px 0 0 7px;
+}
+
+.shell[data-dock-edge="left"] .dock-bead {
+  border-left: 0;
+  border-radius: 0 7px 7px 0;
+}
+
+.shell[data-dock-edge="top"] .dock-bead {
+  border-top: 0;
+  border-radius: 0 0 7px 7px;
+}
+
+.shell[data-dock-edge="top"] .dock-bead-core {
+  width: 28px;
+  height: 6px;
+}
+
+.shell[data-dock-mode="peek"][data-dock-edge="right"] {
+  padding-right: 0;
+}
+
+.shell[data-dock-mode="peek"][data-dock-edge="right"] .pill,
+.shell[data-dock-mode="peek"][data-dock-edge="right"] .panel {
+  border-right: 0;
+  border-radius: 8px 0 0 8px;
+}
+
+.shell[data-dock-mode="peek"][data-dock-edge="left"] {
+  padding-left: 0;
+}
+
+.shell[data-dock-mode="peek"][data-dock-edge="left"] .pill,
+.shell[data-dock-mode="peek"][data-dock-edge="left"] .panel {
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+}
+
+.shell[data-dock-mode="peek"][data-dock-edge="top"] {
+  padding-top: 0;
+}
+
+.shell[data-dock-mode="peek"][data-dock-edge="top"] .pill {
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
 }
 
 .panel-head {
@@ -293,36 +442,12 @@ button {
   color: #a0a0a0;
 }
 
-.lamp[data-status="waiting"] {
-  background: #f4c95d;
-  box-shadow: 0 0 0 5px rgba(244, 201, 93, 0.16), 0 0 18px rgba(244, 201, 93, 0.48);
-}
-
-.lamp[data-status="running"] {
-  background: #63b3ff;
-  box-shadow: 0 0 0 5px rgba(99, 179, 255, 0.16), 0 0 18px rgba(99, 179, 255, 0.48);
-}
-
-.lamp[data-status="done"] {
-  background: #73d38c;
-  box-shadow: 0 0 0 5px rgba(115, 211, 140, 0.16), 0 0 18px rgba(115, 211, 140, 0.46);
-}
-
 .lamp[data-status="error"] {
-  background: #ff5a5f;
-  box-shadow: 0 0 0 5px rgba(255, 90, 95, 0.16), 0 0 18px rgba(255, 90, 95, 0.54);
   animation: error-pulse 0.8s linear infinite;
-}
-
-.lamp[data-status="interrupted"] {
-  background: #ff8a62;
-  box-shadow: 0 0 0 5px rgba(255, 138, 98, 0.16), 0 0 18px rgba(255, 138, 98, 0.44);
 }
 
 /* 新增：连接中状态样式 - 灰色脉冲动画 */
 .lamp[data-status="connecting"] {
-  background: #a0a0a0;
-  box-shadow: 0 0 0 5px rgba(160, 160, 160, 0.16), 0 0 18px rgba(160, 160, 160, 0.36);
   animation: connecting-pulse 1.5s ease-in-out infinite;
 }
 
@@ -362,9 +487,54 @@ button {
   }
 }
 
+@keyframes bead-breath {
+  0%,
+  100% {
+    opacity: 0.55;
+    box-shadow: 0 0 6px var(--status-color);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 16px var(--status-color), 0 0 24px var(--status-glow);
+  }
+}
+
+@keyframes bead-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scaleX(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scaleX(1.35);
+  }
+}
+
 /* 仅在 shell 标记 data-breath="on" 且指示灯为 running 状态时启用呼吸动画 */
 .shell[data-breath="on"] .lamp[data-status="running"] {
   animation: lamp-breath var(--breath-period, 2400ms) ease-in-out infinite;
+}
+
+.shell[data-dock-mode="hidden"][data-status="idle"] .dock-bead-core {
+  opacity: 0.4;
+  box-shadow: none;
+}
+
+.shell[data-breath="on"][data-dock-mode="hidden"][data-status="running"] .dock-bead-core {
+  animation: bead-breath var(--breath-period, 2400ms) ease-in-out infinite;
+}
+
+.shell[data-dock-mode="hidden"][data-status="waiting"] .dock-bead-core {
+  animation: bead-pulse 1.2s ease-in-out infinite;
+}
+
+.shell[data-dock-mode="hidden"][data-status="error"] .dock-bead-core {
+  animation: error-pulse 0.8s linear infinite;
+}
+
+.shell[data-dock-mode="hidden"][data-status="connecting"] .dock-bead-core {
+  animation: connecting-pulse 1.5s ease-in-out infinite;
 }
 
 /* ===== 状态切换闪烁动画 ===== */
@@ -380,7 +550,8 @@ button {
 
 /* 闪烁动画播放期间覆盖 running 呼吸动画，结束后由 animationend 恢复 */
 .shell[data-breath="on"] .lamp.status-blink[data-status],
-.lamp.status-blink[data-status] {
+.lamp.status-blink[data-status],
+.dock-bead-core.status-blink {
   animation: lamp-blink 0.28s ease-in-out var(--blink-count, 3);
 }
 
@@ -392,7 +563,10 @@ button {
   .shell[data-breath="on"] .lamp[data-status="running"],
   .shell[data-breath="on"] .lamp.status-blink[data-status],
   .lamp.status-blink,
-  .lamp.status-blink[data-status] {
+  .lamp.status-blink[data-status],
+  .shell[data-dock-mode="hidden"] .dock-bead,
+  .dock-bead-core,
+  .dock-bead-core.status-blink {
     animation: none;
   }
 }

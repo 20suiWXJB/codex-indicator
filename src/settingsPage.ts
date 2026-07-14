@@ -173,6 +173,8 @@ export function renderSettingsPage(app: HTMLDivElement) {
       rememberWindowState: checkbox("rememberWindowState"),
       minimizeToTray: checkbox("minimizeToTray"),
       panelExpandedHeight: value("panelExpandedHeight"),
+      edgeDockEnabled: checkbox("edgeDockEnabled"),
+      dockHideDelayMs: value("dockHideDelayMs"),
       stateDirMode: value("stateDirMode"),
       stateDir: value("stateDir"),
       codexSessionsDirMode: value("codexSessionsDirMode"),

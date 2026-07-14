@@ -1859,6 +1859,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-window-state",
  "time",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

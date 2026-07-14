@@ -101,6 +101,39 @@ test("settings page renders and saves multi-instance controls", async () => {
   assert.equal(savedSettings.eventInstancePrefix, false);
 });
 
+test("settings page renders and saves dock controls", async () => {
+  const settingsModel = loadSettingsModel();
+  const { document, app } = createSettingsDom();
+  let savedSettings;
+  const invoke = async (command, args) => {
+    if (command === "get_settings") {
+      return { settings: settingsModel.DEFAULT_SETTINGS };
+    }
+    if (command === "save_settings") {
+      savedSettings = args.settings;
+      return { settings: args.settings };
+    }
+    throw new Error(`Unexpected command: ${command}`);
+  };
+
+  const { renderSettingsPage } = loadSettingsPage(settingsModel, invoke, document);
+  renderSettingsPage(app);
+  await flushAsyncWork();
+
+  const form = app.querySelector(".settings-form");
+
+  assert.ok(form.querySelector('input[name="edgeDockEnabled"]'));
+  assert.ok(form.querySelector('[name="dockHideDelayMs"]'));
+
+  form.querySelector('input[name="edgeDockEnabled"]').checked = false;
+  form.querySelector('[name="dockHideDelayMs"]').value = "1200";
+  app.querySelector(".settings-save").click();
+  await flushAsyncWork();
+
+  assert.equal(savedSettings.edgeDockEnabled, false);
+  assert.equal(savedSettings.dockHideDelayMs, 1200);
+});
+
 function loadSettingsModel() {
   return loadModule("src/settingsModel.ts", require);
 }
