@@ -26,3 +26,7 @@ state/events.jsonl
 *.njsproj
 *.sln
 *.sw?
+
+# Sensitive / temporary credentials
+.ssh_key_temp
+
